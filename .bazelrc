@@ -1,0 +1,4 @@
+# Match yikv registries so thrift/babylon/leveldb resolve when @yikv is a dependency.
+common --registry=https://bcr.bazel.build
+common --registry=https://raw.githubusercontent.com/baidu/babylon/main/registry
+common --registry=https://raw.githubusercontent.com/secretflow/bazel-registry/main

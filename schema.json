@@ -1,0 +1,51 @@
+{
+  "table_name": "dsp_test",
+  "pk": "key",
+  "fields": [
+    {
+      "name": "key",
+      "data_type": "string",
+      "is_array": false,
+      "nullable": true,
+      "is_pk": true,
+      "is_index": false,
+      "field_id": 1
+    },
+    {
+      "name": "duf_inner_pkg",
+      "data_type": "string",
+      "is_array": false,
+      "nullable": true,
+      "is_pk": false,
+      "is_index": false,
+      "field_id": 2
+    },
+    {
+      "name": "duf_inner_all",
+      "data_type": "string",
+      "is_array": false,
+      "nullable": true,
+      "is_pk": false,
+      "is_index": false,
+      "field_id": 3
+    },
+    {
+      "name": "duf_outer_pkg",
+      "data_type": "string",
+      "is_array": false,
+      "nullable": true,
+      "is_pk": false,
+      "is_index": false,
+      "field_id": 4
+    },
+    {
+      "name": "duf_all_all",
+      "data_type": "string",
+      "is_array": false,
+      "nullable": true,
+      "is_pk": false,
+      "is_index": false,
+      "field_id": 5
+    }
+  ]
+}

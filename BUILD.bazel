@@ -1,0 +1,96 @@
+load("@rules_cc//cc:defs.bzl", "cc_binary", "cc_library")
+load("@rules_proto//proto:defs.bzl", "proto_library")
+
+package(default_visibility = ["//visibility:public"])
+
+proto_library(
+    name = "yikv_db_wire_proto",
+    srcs = ["proto/yikv_db_wire.proto"],
+)
+
+cc_library(
+    name = "db_fbs",
+    hdrs = ["gen/yikv_server_generated.h"],
+    includes = [
+        "deps/include",
+        "gen",
+    ],
+)
+
+cc_library(
+    name = "rpc_constants",
+    hdrs = ["src/yikv_server/rpc/rpc_constants.h"],
+    includes = ["src/yikv_server"],
+)
+
+cc_library(
+    name = "yikv_server_lib",
+    srcs = [
+        "src/yikv_server/db/handlers.cc",
+        "src/yikv_server/rpc/db_brpc_service.cc",
+    ],
+    hdrs = [
+        "src/yikv_server/db/handlers.h",
+        "src/yikv_server/rpc/db_brpc_service.h",
+    ],
+    copts = ["-std=c++20"],
+    includes = [
+        "src/yikv_server",
+        "gen",
+        "deps/include",
+    ],
+    deps = [
+        ":db_fbs",
+        ":rpc_constants",
+        "@com_github_apache_brpc//:brpc",
+        "@yikv//src/db:db",
+        "@yikv//src/index:kv_index",
+        "@yikv//src/schema:schema",
+    ],
+)
+
+cc_binary(
+    name = "yikv_server",
+    srcs = ["src/yikv_server/main.cc"],
+    copts = ["-std=c++20"],
+    includes = ["src/yikv_server"],
+    deps = [
+        ":yikv_server_lib",
+        "@com_github_apache_brpc//:brpc",
+        "@yikv//src/db:db",
+        "@yikv//src/index:kv_index",
+    ],
+)
+
+cc_binary(
+    name = "yikv_server_bench",
+    srcs = ["src/bench_main.cc"],
+    copts = ["-std=c++20"],
+    includes = [
+        "src/yikv_server",
+        "gen",
+        "deps/include",
+    ],
+    linkopts = [
+        "-lparquet",
+        "-larrow",
+        "-pthread",
+    ],
+    deps = [
+        ":db_fbs",
+        ":rpc_constants",
+        "@com_github_apache_brpc//:brpc",
+    ],
+)
+
+cc_binary(
+    name = "yikv_import_parquet",
+    srcs = ["src/import_parquet_main.cc"],
+    copts = ["-std=c++20"],
+    linkopts = ["-lparquet", "-larrow", "-pthread"],
+    deps = [
+        "@yikv//src/db:db",
+        "@yikv//src/index:kv_index",
+        "@yikv//src/schema:schema",
+    ],
+)
