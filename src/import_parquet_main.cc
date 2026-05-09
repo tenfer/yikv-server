@@ -19,6 +19,7 @@
 #include <cctype>
 #include <cstdlib>
 #include <cstring>
+#include <ctime>
 #include <filesystem>
 #include <fstream>
 #include <iostream>
@@ -38,6 +39,17 @@ using yikv::schema::FieldDef;
 using yikv::schema::Schema;
 
 namespace {
+
+// Returns current local time as "YYYY-MM-DD HH:MM:SS".
+static std::string WallTimestamp() {
+    const auto now  = std::chrono::system_clock::now();
+    const std::time_t t = std::chrono::system_clock::to_time_t(now);
+    struct tm tm_buf {};
+    ::localtime_r(&t, &tm_buf);
+    char buf[32];
+    std::strftime(buf, sizeof(buf), "%Y-%m-%d %H:%M:%S", &tm_buf);
+    return buf;
+}
 
 static bool EndsWithParquetExtension(const fs::path& p) {
     std::string ext = p.extension().string();
@@ -418,7 +430,8 @@ static void LogImportMilestone(uint64_t               total_imported,
     const auto   iv_tps_ll    = static_cast<long long>(interval_tps + 0.5);
     const auto   ov_tps_ll    = static_cast<long long>(overall_tps + 0.5);
 
-    std::cerr << "import_progress total_rows=" << total_imported << " file_index=" << file_index_1based
+    std::cerr << WallTimestamp()
+              << " import_progress total_rows=" << total_imported << " file_index=" << file_index_1based
               << "/" << num_files << " parquet_file=" << fs::path(path).filename().string()
               << " parquet_path=" << path << " interval_tps=" << iv_tps_ll << " overall_tps=" << ov_tps_ll
               << "\n";
@@ -539,7 +552,8 @@ int main(int argc, char** argv) {
     // Reading Parquet metadata is fast (no data pages accessed).
     const uint64_t est_rows   = EstimateTotalRows(fl.input_files);
     const uint32_t bucket_bits = BucketBitsForRows(est_rows);
-    std::cerr << "import_init estimated_rows=" << est_rows
+    std::cerr << WallTimestamp()
+              << " import_init estimated_rows=" << est_rows
               << " bucket_bits=" << bucket_bits
               << " (bucket_count=" << (uint64_t{1} << bucket_bits) << ")\n";
 
@@ -580,7 +594,7 @@ int main(int argc, char** argv) {
         arrow::Status        st =
             ImportFile(idx, *sch, path, fi + 1, n_files, &total_rows, &skipped_pk_null, &prog);
         if (!st.ok()) {
-            std::cerr << "import " << path << ": " << st.ToString() << "\n";
+            std::cerr << WallTimestamp() << " import " << path << ": " << st.ToString() << "\n";
             return 1;
         }
         ++files_ok;
@@ -589,7 +603,8 @@ int main(int argc, char** argv) {
     const auto t1    = std::chrono::steady_clock::now();
     const double sec = std::chrono::duration<double>(t1 - t0).count();
 
-    std::cerr << "{\"files\":" << files_ok << ",\"rows\":" << total_rows
+    std::cerr << WallTimestamp()
+              << " {\"files\":" << files_ok << ",\"rows\":" << total_rows
               << ",\"skipped_pk_null\":" << skipped_pk_null << ",\"wall_sec\":" << sec
               << ",\"rows_per_sec\":" << (sec > 0 ? static_cast<double>(total_rows) / sec : 0.0)
               << "}\n";
