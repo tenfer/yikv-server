@@ -2,3 +2,4 @@ nohup.out
 bazel*
 artifact-storage.yaml
 *.pyc
+__pycache__

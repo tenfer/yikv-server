@@ -53,13 +53,16 @@ int main(int argc, char** argv) {
 
     // ── TableRegistry: scan all tables, start KafkaSources ───────────────────
     yikv_server::TableRegistry reg(cfg.db_path, cfg.kafka_default_brokers);
+
+    // Admin socket must come before ScanAndLoad: opening many / large tables can take
+    // minutes; deployIndex and start.sh probe connectability before BRPC starts.
+    yikv_server::StartAdminUnixSocket(cfg.admin_unix_socket, &reg);
+
     reg.ScanAndLoad();
 
     if (reg.TableCount() == 0) {
         std::cerr << "WARNING: no tables found under " << cfg.db_path << "\n";
     }
-
-    yikv_server::StartAdminUnixSocket(cfg.admin_unix_socket, &reg);
 
     // ── RPC services ──────────────────────────────────────────────────────────
     yikv_server::rpc::YikvDbGrpcService grpc_svc(&reg);

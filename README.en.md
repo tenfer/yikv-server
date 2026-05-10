@@ -75,6 +75,22 @@ Use **`yikv_import_pipeline`**. Before import, **stop** `yikv_server` if it hold
 
 To sync a table directory to a **local artifact root** or **S3-compatible object storage** after `yikv_import_pipeline`, use **`tools/artifact_sync/`**: one `artifact-storage.yaml` switches `local` vs `s3_compatible` without changing the import binary. See **[`tools/artifact_sync/README.md`](tools/artifact_sync/README.md)**.
 
+### 3.1.2 End-to-end offline index pipeline (build → artifacts → online)
+
+Usually split between a **build host** and an **online host** (they may be the same machine). Schedulers call HTTP only; paths come from per-host env vars (see the header of [`tools/pipeline_agent/pipeline_agent.py`](tools/pipeline_agent/pipeline_agent.py)).
+
+| Step | What happens | Notes |
+|------|----------------|------|
+| 1. Offline import | `yikv_import_pipeline` or **`POST /buildIndex` / `/publishIndex`** | Same **`schema.json`** as production. The **pipeline agent** removes **`BUILD_DB/<table>`** (default **`$WORK/build_db/<table>`**) before each import, then runs **`--create_if_missing`** for a full rebuild—avoid reopening an existing tree and duplicating rows. |
+| 2. Upload artifact | **`POST /pushIndex`** or push inside publish | Writes a timestamp **`build_id`** tree into the artifact store (local root or S3-compatible), same model as **`tools/artifact_sync/`**. |
+| 3. Pull & switch | **`POST /deployIndex`** or `artifact_sync pull … --switch-active` | Materializes **`$WORK/releases/<table>/<build_id>/`** and atomically points **`active`** at that build. |
+| 4. Server layout | `link` (inside deploy) | **`SERVER_DB/<table>`** → **`releases/<table>/active`** (**`SERVER_DB`** defaults to **`$WORK/server_db`** and must match **`db_path`** in **`config.json`**). |
+| 5. Hot reload | **`reload <table>`** | Sent on **`admin_unix_socket`** (defaults to **`parent(db_path)/admin.sock`**, which lines up with **`$WORK/admin.sock`** when `db_path` is **`…/server_db`**). **`ReloadTable`** remaps mmap without restarting **`yikv_server`**. |
+
+**Thin scheduler**: run [`tools/schedule_pipeline.py`](tools/schedule_pipeline.py) (or [`tools/pipeline_reload.py`](tools/pipeline_reload.py))—**`/publishIndex`** on the build agent, then **`/deployIndex`** on the online agent. See **`--help`** for **`BUILD_AGENT_URL`**, **`ONLINE_AGENT_URL`**, **`--table`**, **`--data-dir`**, etc.
+
+**Sanity checks**: after deploy, `readlink -f $db_path/<table>` should resolve to **`…/releases/<table>/<build_id>`**; `printf 'reload <table>\n' | nc -U <admin.sock>` should print **`ok`**. RPC / admin details: **[`db.md`](db.md)** §3, **[`tools/artifact_sync/README.md`](tools/artifact_sync/README.md)**.
+
 ### 3.2 Run the server
 
 Single argument: path to config file.

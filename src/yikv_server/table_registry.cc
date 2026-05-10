@@ -117,6 +117,7 @@ std::shared_ptr<TableSlot> TableRegistry::BuildSlotAfterOpen(const std::string& 
 // ─── LoadTable ───────────────────────────────────────────────────────────────
 
 bool TableRegistry::LoadTable(const fs::path& table_dir) {
+    std::lock_guard<std::mutex> load_lk(load_table_mu_);
     const std::string name = table_dir.filename().string();
     if (name.empty() || name[0] == '.') return false;
     if (IsReservedReloadStagingDirName(name)) return false;
@@ -233,6 +234,9 @@ void TableRegistry::ReloadTable(const std::string& table_name) {
     }
 
     try {
+        // Always drop any stale registration for next_db before opening, so we never hit
+        // DB::OpenIndex's early return while the on-disk symlink (e.g. active -> build_id) changed.
+        yikv::db::DB::Instance().CloseIndex(next_db);
         yikv::db::DB::Instance().OpenIndex(next_db);
     } catch (...) {
         if (next_db != table_name) {

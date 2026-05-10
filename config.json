@@ -1,5 +1,5 @@
 {
-  "db_path": "/data/yikv-pipeline-run/server_db",
+  "db_path": "/data/yikvdb/server_db",
   "listen": "0.0.0.0:9000",
   "arena_seg_gb": 1,
   "arena_max_gb": 100,

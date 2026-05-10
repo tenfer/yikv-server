@@ -9,30 +9,40 @@ set via environment on each machine. Schedulers should call HTTP only — see to
 
 No authentication (use private network / VPC).
 
-Environment (defaults align with tools/pipeline_reload.sh):
+  PIPELINE_CONFIG   optional JSON path: merged on top of tools/pipeline_agent/pipeline.defaults.json (if that file exists)
+
+Environment (override JSON — same names as export from pipeline_config.py --emit-shell):
   YIKV_ROOT          repo root (default: parent of tools/)
   WORK               default /data/yikvdb
   BUILD_DB           default $WORK/build_db
   SERVER_DB          default $WORK/server_db
   ARTIFACT_STORE     default $WORK/artifact_store (when auto-creating artifact-storage.yaml)
   ARTIFACT_KEY_PREFIX  default yikv-index
+  ARTIFACT_ENV       default dev (artifact-storage.yaml)
   ARTIFACT_YAML      default $WORK/artifact-storage.yaml (created with provider: local if missing)
-  ADMIN_SOCKET       default $WORK/admin.sock
-  SERVER_CONFIG      default $WORK/config.server.json
+  ADMIN_SOCKET       default $WORK/admin.sock (should match parent(db_path)/admin.sock when db_path is $WORK/server_db)
+  SERVER_CONFIG      default $WORK/config.server.json — must exist (manual); see config.example.json
   YIKV_IMPORT_BIN    default $YIKV_ROOT/bazel-bin/yikv_import_pipeline
   YIKV_SERVER_BIN    default $YIKV_ROOT/bazel-bin/yikv_server
   SCHEMA_JSON        default $YIKV_ROOT/schema.json (buildIndex fallback)
   IMPORT_LISTEN      default 127.0.0.1:59999 (import pipeline config listen)
-  SERVER_LISTEN      default 0.0.0.0:9000 (written into SERVER_CONFIG)
+  SERVER_LISTEN      not written by agent; set listen in SERVER_CONFIG to match your RPC bind address
   AUTO_START_SERVER  default 1 — deployIndex / switchReloadIndex may start yikv_server if admin socket missing
+                        (stale socket files left after a crash are removed after a failed connect probe)
+  PIPELINE_ARENA_MAX_GB  import + server JSON (default 4; must match offline build or OpenIndex fails)
+  PIPELINE_ARENA_SEG_GB  segment size in GB (default 1)
+  IMPORT_IO_WORKERS     yikv_import_pipeline parallel readers (default 1; lower RAM)
+  IMPORT_QUEUE_BATCHES  max RecordBatches in flight (default 8; lower RAM)
   HOST               default 0.0.0.0
   PORT               default 8787
+  ADMIN_SOCKET_WAIT_SEC  max seconds to wait for yikv_server admin socket after auto-start (default 90)
 """
 
 from __future__ import annotations
 
 import json
 import os
+import shutil
 import socket
 import subprocess
 import threading
@@ -43,28 +53,33 @@ from typing import Any
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field, model_validator
 
-# --- paths & env ---
+from pipeline_config import load_pipeline_settings
 
-_SCRIPT_DIR = Path(__file__).resolve().parent
-_YIKV_ROOT_ENV = os.environ.get("YIKV_ROOT")
-YIKV_ROOT = Path(_YIKV_ROOT_ENV if _YIKV_ROOT_ENV else _SCRIPT_DIR.parent.parent).resolve()
+_S = load_pipeline_settings()
 
-WORK = Path(os.environ.get("WORK", "/data/yikvdb")).resolve()
-BUILD_DB = Path(os.environ.get("BUILD_DB", str(WORK / "build_db"))).resolve()
-SERVER_DB = Path(os.environ.get("SERVER_DB", str(WORK / "server_db"))).resolve()
-ARTIFACT_STORE = Path(os.environ.get("ARTIFACT_STORE", str(WORK / "artifact_store"))).resolve()
-ARTIFACT_KEY_PREFIX = os.environ.get("ARTIFACT_KEY_PREFIX", "yikv-index")
-ARTIFACT_YAML = Path(os.environ.get("ARTIFACT_YAML", str(WORK / "artifact-storage.yaml"))).resolve()
-ADMIN_SOCKET = Path(os.environ.get("ADMIN_SOCKET", str(WORK / "admin.sock"))).resolve()
-SERVER_CONFIG = Path(os.environ.get("SERVER_CONFIG", str(WORK / "config.server.json"))).resolve()
-IMPORT_BIN = Path(os.environ.get("YIKV_IMPORT_BIN", str(YIKV_ROOT / "bazel-bin/yikv_import_pipeline")))
-YIKV_SERVER_BIN = Path(os.environ.get("YIKV_SERVER_BIN", str(YIKV_ROOT / "bazel-bin/yikv_server")))
-SCHEMA_JSON_DEFAULT = Path(os.environ.get("SCHEMA_JSON", str(YIKV_ROOT / "schema.json"))).resolve()
-IMPORT_LISTEN = os.environ.get("IMPORT_LISTEN", "127.0.0.1:59999")
-SERVER_LISTEN = os.environ.get("SERVER_LISTEN", "0.0.0.0:9000")
-AUTO_START_SERVER = os.environ.get("AUTO_START_SERVER", "1") == "1"
+YIKV_ROOT = _S.yikv_root
+WORK = _S.work
+BUILD_DB = _S.build_db
+SERVER_DB = _S.server_db
+ARTIFACT_STORE = _S.artifact_store
+ARTIFACT_KEY_PREFIX = _S.artifact_key_prefix
+ARTIFACT_ENV = _S.artifact_env
+ARTIFACT_YAML = _S.artifact_yaml
+ADMIN_SOCKET = _S.admin_socket
+SERVER_CONFIG = _S.server_config
+IMPORT_BIN = _S.import_bin
+YIKV_SERVER_BIN = _S.server_bin
+SCHEMA_JSON_DEFAULT = _S.schema_json
+IMPORT_LISTEN = _S.import_listen
+SERVER_LISTEN = _S.server_listen
+AUTO_START_SERVER = _S.auto_start_server
+PIPELINE_ARENA_SEG_GB = _S.arena_seg_gb
+PIPELINE_ARENA_MAX_GB = _S.arena_max_gb
+IMPORT_IO_WORKERS = _S.import_io_workers
+IMPORT_QUEUE_BATCHES = _S.import_queue_batches
 
 ARTIFACT_PY = YIKV_ROOT / "tools" / "artifact_sync" / "artifact_sync.py"
+
 
 _import_lock = threading.Lock()
 app = FastAPI(title="yikv pipeline agent", version="1.0.0")
@@ -75,14 +90,14 @@ def _release_root(table: str) -> Path:
 
 
 def ensure_artifact_yaml_local() -> None:
-    """If ARTIFACT_YAML is missing, write a minimal provider: local config (same idea as pipeline_reload.sh)."""
+    """If ARTIFACT_YAML is missing, write a minimal provider: local config (same layout as artifact-storage.example.yaml)."""
     if ARTIFACT_YAML.is_file():
         return
     WORK.mkdir(parents=True, exist_ok=True)
     ARTIFACT_STORE.mkdir(parents=True, exist_ok=True)
     text = (
         "provider: local\n"
-        "env: dev\n"
+        f"env: {ARTIFACT_ENV}\n"
         f"key_prefix: {ARTIFACT_KEY_PREFIX}\n"
         "local:\n"
         f"  root: {ARTIFACT_STORE}\n"
@@ -98,8 +113,8 @@ def _write_import_config(table: str) -> Path:
     body: dict[str, Any] = {
         "db_path": str(BUILD_DB),
         "listen": IMPORT_LISTEN,
-        "arena_seg_gb": 1,
-        "arena_max_gb": 4,
+        "arena_seg_gb": PIPELINE_ARENA_SEG_GB,
+        "arena_max_gb": PIPELINE_ARENA_MAX_GB,
         "exclusive_arena_lock": False,
         "admin_unix_socket": str(ADMIN_SOCKET),
     }
@@ -129,16 +144,133 @@ def _ensure_executable(bin_path: Path, hint: str) -> None:
         raise HTTPException(status_code=500, detail=f"not executable: {bin_path} ({hint})")
 
 
+def _admin_wait_max_sec() -> float:
+    raw = os.environ.get("ADMIN_SOCKET_WAIT_SEC", "").strip()
+    if raw:
+        return max(5.0, float(raw))
+    return 90.0
+
+
+def _tail_file(path: Path, *, max_lines: int = 120, max_chars: int = 32000) -> str:
+    if not path.is_file():
+        return "(no log file yet)"
+    try:
+        data = path.read_bytes()
+    except OSError as exc:
+        return f"(cannot read log: {exc})"
+    if len(data) > max_chars:
+        data = data[-max_chars:]
+    text = data.decode("utf-8", errors="replace")
+    lines = text.splitlines()
+    if len(lines) > max_lines:
+        lines = lines[-max_lines:]
+    return "\n".join(lines)
+
+
+def _default_admin_unix_for_db_path(db_path_str: str) -> Path:
+    """Match yikv_server LoadServerConfig when admin_unix_socket is omitted: parent(db_path)/admin.sock."""
+    dbp = Path(str(db_path_str).strip()).expanduser()
+    return (dbp.parent / "admin.sock").resolve()
+
+
+def _require_server_config_admin_socket() -> None:
+    """Ensure effective admin path matches ADMIN_SOCKET (implicit default or explicit JSON)."""
+    try:
+        cfg = json.loads(SERVER_CONFIG.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        raise HTTPException(status_code=503, detail=f"missing server config {SERVER_CONFIG}") from None
+    except json.JSONDecodeError as exc:
+        raise HTTPException(status_code=503, detail=f"invalid JSON in {SERVER_CONFIG}: {exc}") from exc
+    db_path = cfg.get("db_path")
+    if not db_path or not str(db_path).strip():
+        raise HTTPException(status_code=503, detail=f"{SERVER_CONFIG} missing db_path")
+    raw = cfg.get("admin_unix_socket")
+    if raw is None or not str(raw).strip():
+        effective = _default_admin_unix_for_db_path(str(db_path))
+    else:
+        effective = Path(str(raw).strip()).expanduser().resolve()
+    want = ADMIN_SOCKET.expanduser().resolve()
+    if effective != want:
+        raise HTTPException(
+            status_code=503,
+            detail=(
+                f"admin_unix_socket effective path {effective} != agent ADMIN_SOCKET {want}. "
+                f"Set admin_unix_socket in {SERVER_CONFIG} or align WORK/SERVER_DB/ADMIN_SOCKET "
+                f"(default rule: parent(db_path)/admin.sock)."
+            ),
+        )
+
+
+def _admin_unix_reachable(*, timeout_sec: float = 2.0) -> bool:
+    """True if yikv_server is accepting connections on ADMIN_SOCKET (not just a leftover inode)."""
+    if not ADMIN_SOCKET.is_socket():
+        return False
+    try:
+        s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        try:
+            s.settimeout(timeout_sec)
+            s.connect(str(ADMIN_SOCKET))
+        finally:
+            s.close()
+        return True
+    except OSError:
+        return False
+
+
+def _wait_admin_unix_ready(
+    *,
+    proc: subprocess.Popen[Any] | None,
+    max_wait_sec: float,
+    interval_sec: float = 0.2,
+) -> None:
+    """Poll until the admin socket accepts connections (not only Path.is_socket())."""
+    log = WORK / "yikv_server.log"
+    deadline = time.monotonic() + max_wait_sec
+    while time.monotonic() < deadline:
+        if proc is not None:
+            rc = proc.poll()
+            if rc is not None:
+                tail = _tail_file(log)
+                raise HTTPException(
+                    status_code=500,
+                    detail=(
+                        f"yikv_server exited before admin socket was ready (exit code {rc}). "
+                        f"Binary {YIKV_SERVER_BIN}. Config {SERVER_CONFIG}.\n"
+                        f"--- tail of {log} ---\n{tail}"
+                    ),
+                )
+        if _admin_unix_reachable(timeout_sec=0.5):
+            return
+        time.sleep(interval_sec)
+    tail = _tail_file(log)
+    raise HTTPException(
+        status_code=504,
+        detail=(
+            f"yikv_server did not accept connections on {ADMIN_SOCKET} within {max_wait_sec:.0f}s "
+            f"(ADMIN_SOCKET_WAIT_SEC). "
+            f"Confirm {SERVER_CONFIG} has admin_unix_socket matching this path and that "
+            f"{YIKV_SERVER_BIN} is rebuilt (admin listens before ScanAndLoad).\n"
+            f"--- tail of {log} ---\n{tail}"
+        ),
+    )
+
+
 def ensure_yikv_server_for_reload() -> None:
-    if ADMIN_SOCKET.is_socket():
+    if _admin_unix_reachable():
         return
+    if ADMIN_SOCKET.is_socket():
+        try:
+            ADMIN_SOCKET.unlink()
+        except OSError:
+            pass
     if not AUTO_START_SERVER:
         raise HTTPException(
             status_code=503,
             detail=f"admin socket not available: {ADMIN_SOCKET} (set AUTO_START_SERVER=1 to auto-start)",
         )
     if not SERVER_CONFIG.is_file():
-        raise HTTPException(status_code=503, detail=f"missing server config {SERVER_CONFIG}; run switchReloadIndex or create it")
+        raise HTTPException(status_code=503, detail=f"missing server config {SERVER_CONFIG}; create it manually (see config.example.json)")
+    _require_server_config_admin_socket()
     _ensure_executable(YIKV_SERVER_BIN, "bazel build //:yikv_server")
     WORK.mkdir(parents=True, exist_ok=True)
     log = WORK / "yikv_server.log"
@@ -151,44 +283,80 @@ def ensure_yikv_server_for_reload() -> None:
             stderr=subprocess.STDOUT,
         )
     pidfile.write_text(str(p.pid), encoding="utf-8")
-    for _ in range(150):
-        if ADMIN_SOCKET.is_socket():
-            return
-        time.sleep(0.2)
-    raise HTTPException(status_code=504, detail=f"yikv_server did not open {ADMIN_SOCKET} in 30s (log {log})")
+    _wait_admin_unix_ready(proc=p, max_wait_sec=_admin_wait_max_sec(), interval_sec=0.2)
 
 
 def send_reload(table: str) -> str:
     ensure_yikv_server_for_reload()
-    if not ADMIN_SOCKET.is_socket():
-        raise HTTPException(status_code=503, detail=f"admin socket missing: {ADMIN_SOCKET}")
-    sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+
+    def _exchange() -> str:
+        sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        try:
+            sock.settimeout(30.0)
+            sock.connect(str(ADMIN_SOCKET))
+            sock.sendall(f"reload {table}\n".encode())
+            data = sock.recv(4096)
+        finally:
+            sock.close()
+        return data.decode(errors="replace")
+
     try:
-        sock.connect(str(ADMIN_SOCKET))
-        sock.sendall(f"reload {table}\n".encode())
-        data = sock.recv(4096)
-    finally:
-        sock.close()
-    return data.decode(errors="replace")
+        reply = _exchange()
+    except ConnectionRefusedError:
+        if ADMIN_SOCKET.is_socket():
+            try:
+                ADMIN_SOCKET.unlink()
+            except OSError:
+                pass
+        ensure_yikv_server_for_reload()
+        reply = _exchange()
+    rstrip = reply.strip()
+    if not rstrip.startswith("ok"):
+        raise HTTPException(
+            status_code=500,
+            detail=(
+                f"admin reload {table!r} on {ADMIN_SOCKET} did not succeed: {rstrip!r}. "
+                f"Confirm the yikv_server process uses the same admin_unix_socket as this agent "
+                f"(see SERVER_CONFIG / config parent(db_path)/admin.sock)."
+            ),
+        )
+    return reply
 
 
 def link_server_table(table: str) -> None:
+    """Symlink SERVER_DB/<table> -> releases/<table>/active. Does not write SERVER_CONFIG (operator creates it)."""
+    if not SERVER_CONFIG.is_file():
+        ex = YIKV_ROOT / "config.example.json"
+        raise HTTPException(
+            status_code=503,
+            detail=(
+                f"SERVER_CONFIG missing: {SERVER_CONFIG}. Create it manually (e.g. copy {ex}); "
+                f"db_path must be {SERVER_DB.resolve()} for this pipeline layout."
+            ),
+        )
+    try:
+        cfg = json.loads(SERVER_CONFIG.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as exc:
+        raise HTTPException(status_code=503, detail=f"invalid JSON in {SERVER_CONFIG}: {exc}") from exc
+    raw_db = cfg.get("db_path")
+    if not raw_db or not str(raw_db).strip():
+        raise HTTPException(status_code=503, detail=f"{SERVER_CONFIG} must set db_path to {SERVER_DB.resolve()}")
+    cfg_db = Path(str(raw_db).strip()).expanduser().resolve()
+    if cfg_db != SERVER_DB.resolve():
+        raise HTTPException(
+            status_code=503,
+            detail=(
+                f"{SERVER_CONFIG} db_path is {cfg_db}, expected {SERVER_DB.resolve()} "
+                f"(SERVER_DB env / pipeline layout)"
+            ),
+        )
+
     release_root = _release_root(table)
     SERVER_DB.mkdir(parents=True, exist_ok=True)
     tlink = SERVER_DB / table
     if tlink.exists() or tlink.is_symlink():
         tlink.unlink()
     tlink.symlink_to(release_root / "active", target_is_directory=True)
-    body: dict[str, Any] = {
-        "db_path": str(SERVER_DB),
-        "listen": SERVER_LISTEN,
-        "arena_seg_gb": 1,
-        "arena_max_gb": 512,
-        "exclusive_arena_lock": True,
-        "admin_unix_socket": str(ADMIN_SOCKET),
-    }
-    SERVER_CONFIG.parent.mkdir(parents=True, exist_ok=True)
-    SERVER_CONFIG.write_text(json.dumps(body, indent=2) + "\n", encoding="utf-8")
 
 
 # --- request models ---
@@ -199,8 +367,14 @@ class BuildIndexBody(BaseModel):
     input: str | None = Field(None, description="Single .parquet/.csv file on this host")
     data_dir: str | None = Field(None, description="Directory scanned recursively for data files (--input_dir)")
     schema_json: str | None = Field(None, description="Defaults to SCHEMA_JSON env / repo schema.json")
-    create_if_missing: bool = False
-    recreate: bool = False
+    create_if_missing: bool = Field(
+        False,
+        description="Ignored; yikv_import_pipeline always runs with --create_if_missing after removing BUILD_DB/<table>.",
+    )
+    recreate: bool = Field(
+        False,
+        description="Ignored for import; every build always deletes BUILD_DB/<table> on this host then creates a new index directory.",
+    )
 
     @model_validator(mode="after")
     def exactly_one_input_source(self) -> BuildIndexBody:
@@ -218,7 +392,10 @@ class PublishIndexBody(BaseModel):
     input: str | None = None
     data_dir: str | None = None
     schema_json: str | None = None
-    recreate: bool = False
+    recreate: bool = Field(
+        False,
+        description="Ignored for import; every publish build deletes BUILD_DB/<table> on this host then creates a new index directory.",
+    )
     build_id: str | None = Field(None, description="Optional explicit build_id for push; else auto")
 
     @model_validator(mode="after")
@@ -257,6 +434,15 @@ class SwitchReloadBody(BaseModel):
     build_id: str | None = Field(None, description="Version dir under releases/<table>/; omit = lexicographic max local")
 
 
+def _remove_local_build_index(path: Path) -> None:
+    """Remove BUILD_DB/<table> so the next import always creates a fresh on-disk index."""
+    if path.is_symlink() or path.is_file():
+        path.unlink()
+        return
+    if path.is_dir():
+        shutil.rmtree(path)
+
+
 def _build_index_impl(body: BuildIndexBody) -> dict[str, Any]:
     schema = Path(body.schema_json or SCHEMA_JSON_DEFAULT).resolve()
     if not schema.is_file():
@@ -267,6 +453,8 @@ def _build_index_impl(body: BuildIndexBody) -> dict[str, Any]:
     BUILD_DB.mkdir(parents=True, exist_ok=True)
 
     index_dir = BUILD_DB / body.table
+    _remove_local_build_index(index_dir)
+
     cfg_path = _write_import_config(body.table)
     cmd: list[str] = [
         str(IMPORT_BIN),
@@ -277,32 +465,37 @@ def _build_index_impl(body: BuildIndexBody) -> dict[str, Any]:
         "--schema_json",
         str(schema),
     ]
-    extra: list[str] = []
+    extra: list[str] = ["--create_if_missing"]
 
     if body.data_dir is not None:
         dpath = Path(body.data_dir).resolve()
         if not dpath.is_dir():
             raise HTTPException(status_code=400, detail=f"data_dir not a directory: {dpath}")
         cmd.extend(["--input_dir", str(dpath)])
-        if body.recreate:
-            extra.append("--recreate")
-        elif not index_dir.is_dir():
-            extra.append("--create_if_missing")
     else:
         inp = Path(body.input or "").resolve()
         if not inp.is_file():
             raise HTTPException(status_code=400, detail=f"input not found: {inp}")
         cmd.extend(["--input", str(inp)])
-        if body.recreate:
-            extra.append("--recreate")
-        if body.create_if_missing:
-            extra.append("--create_if_missing")
 
     cmd.extend(extra)
+    cmd.extend(
+        [
+            "--import_io_workers",
+            str(IMPORT_IO_WORKERS),
+            "--import_queue_batches",
+            str(IMPORT_QUEUE_BATCHES),
+        ]
+    )
     r = subprocess.run(cmd, cwd=str(YIKV_ROOT), capture_output=True, text=True, check=False)
     if r.returncode != 0:
         msg = (r.stderr or "") + (r.stdout or "")
-        raise HTTPException(status_code=500, detail=msg.strip() or "yikv_import_pipeline failed")
+        tail = msg.strip() or "yikv_import_pipeline failed"
+        cmd_line = " ".join(cmd)
+        raise HTTPException(
+            status_code=500,
+            detail=f"import cmd (argv): {cmd_line}\n---\n{tail}",
+        )
 
     return {
         "ok": True,

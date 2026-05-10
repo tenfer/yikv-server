@@ -15,6 +15,7 @@
 //     window where the table has no index (unlike close-then-open on one key).
 //
 // Thread-safety:
+//  - load_table_mu: serializes LoadTable (startup scan vs admin hot-open).
 //  - head.mu: protects slot pointer / staging_is_live for brief read/write.
 //  - reload_serial: only one ReloadTable at a time per table.
 //  - Each table's write_mu serialises KVIndex mutations (single-writer rule).
@@ -115,6 +116,8 @@ private:
     std::string           default_brokers_;
 
     mutable std::shared_mutex mu_;
+    // Serializes LoadTable to avoid races between ScanAndLoad and admin ReloadTable hot-open.
+    std::mutex load_table_mu_;
     std::unordered_map<std::string, std::unique_ptr<TableHead>> heads_;
 };
 

@@ -1,13 +1,12 @@
 #!/usr/bin/env python3
 """Compatibility entrypoint: delegates to schedule_pipeline (HTTP agents).
 
-The all-in-one import/push/pull/reload implementation lives in pipeline_agent + this thin client.
-For shell-based local debugging without agents, see tools/pipeline_reload.sh (legacy).
+Use tools/pipeline_agent/pipeline_agent.py on build/online hosts and tools/schedule_pipeline.py from the scheduler.
 
   pip install -r tools/pipeline_agent/requirements.txt
-  python3 tools/pipeline_agent/pipeline_agent.py   # on build and/or online hosts
+  python3 tools/pipeline_agent/pipeline_agent.py
 
-  python3 tools/pipeline_reload.py --data-dir /path/to/raw   # same flags as schedule_pipeline.py
+  python3 tools/pipeline_reload.py --data-dir /path/to/raw -v   # stderr: full args + JSON bodies
 """
 
 from __future__ import annotations

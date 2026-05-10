@@ -9,7 +9,9 @@ Environment:
   TABLE             default dsp_test5 (overridable by --table)
 
 Examples:
-  ./tools/schedule_pipeline.py --data-dir /data/raw/my_table
+  TABLE=my_table ./tools/schedule_pipeline.py --data-dir /data/raw/my_table
+  ./tools/schedule_pipeline.py --data-dir /data/raw/my_table --table my_table
+  ./tools/schedule_pipeline.py -v --data-dir /path   # print resolved args and HTTP bodies (stderr)
   ./tools/schedule_pipeline.py --input /data/raw/file.parquet --table t1
   BUILD_AGENT_URL=http://build:8787 ONLINE_AGENT_URL=http://online:8789 \\
     ./tools/schedule_pipeline.py --data-dir /data/raw --table t1
@@ -26,6 +28,7 @@ import argparse
 import json
 import os
 import sys
+from pathlib import Path
 import urllib.error
 import urllib.request
 from typing import Any
@@ -67,7 +70,7 @@ def main(argv: list[str] | None = None) -> None:
     ap.add_argument("--data-dir", type=str, default=None, help="Raw data directory (on build host)")
     ap.add_argument("--input", type=str, default=None, help="Single data file (on build host)")
     ap.add_argument("--schema-json", type=str, default=None, help="Forwarded to publishIndex")
-    ap.add_argument("--recreate", action="store_true")
+    ap.add_argument("--recreate", action="store_true", help="Ignored; build agent always replaces BUILD_DB/<table>")
     ap.add_argument(
         "--deploy-build-id",
         type=str,
@@ -83,7 +86,38 @@ def main(argv: list[str] | None = None) -> None:
         action="store_true",
         help="Only POST /switchReloadIndex on online agent (no pull; release layout must exist)",
     )
+    ap.add_argument(
+        "-v",
+        "--verbose",
+        action="store_true",
+        help="Print effective URLs, table, and full JSON bodies before each HTTP POST",
+    )
     args = ap.parse_args(argv)
+
+    def _print_params(title: str, payload: dict[str, Any]) -> None:
+        if not args.verbose:
+            return
+        print(f"### {title}", file=sys.stderr)
+        print(json.dumps(payload, indent=2, ensure_ascii=False), file=sys.stderr)
+
+    if args.verbose:
+        overview = {
+            "build_url": args.build_url,
+            "online_url": args.online_url,
+            "table": args.table,
+            "data_dir": args.data_dir,
+            "input": args.input,
+            "schema_json": args.schema_json,
+            "recreate": args.recreate,
+            "deploy_build_id": args.deploy_build_id,
+            "max_local_versions": args.max_local_versions,
+            "force_refresh": args.force_refresh,
+            "publish_only": args.publish_only,
+            "deploy_only": args.deploy_only,
+            "reload_only": args.reload_only,
+        }
+        print("### schedule_pipeline resolved arguments", file=sys.stderr)
+        print(json.dumps(overview, indent=2, ensure_ascii=False), file=sys.stderr)
 
     if args.reload_only:
         if args.publish_only or args.deploy_only:
@@ -91,12 +125,23 @@ def main(argv: list[str] | None = None) -> None:
         body: dict[str, Any] = {"table": args.table}
         if args.deploy_build_id:
             body["build_id"] = args.deploy_build_id
+        _print_params("POST /switchReloadIndex (body)", body)
         r = _post_json(args.online_url, "/switchReloadIndex", body)
         print(json.dumps(r, indent=2))
         return
 
     has_in = args.input is not None and args.input.strip() != ""
     has_dir = args.data_dir is not None and args.data_dir.strip() != ""
+    if has_dir:
+        leaf = Path(args.data_dir).expanduser().resolve().name
+        if leaf != args.table:
+            print(
+                f"schedule_pipeline: WARNING: --table {args.table!r} differs from data_dir leaf {leaf!r}. "
+                f"Index artifact and server table name are driven by --table, not the directory name. "
+                f"If you intend to build {leaf!r}, run with e.g. --table {leaf}.",
+                file=sys.stderr,
+            )
+
     if has_in == has_dir and not args.deploy_only:
         ap.error("provide exactly one of --data-dir or --input (unless --deploy-only)")
 
@@ -116,6 +161,7 @@ def main(argv: list[str] | None = None) -> None:
             pub["data_dir"] = args.data_dir
         else:
             pub["input"] = args.input
+        _print_params("POST /publishIndex (body)", pub)
         pr = _post_json(args.build_url, "/publishIndex", pub)
         print(json.dumps(pr, indent=2))
         if args.publish_only:
@@ -131,6 +177,7 @@ def main(argv: list[str] | None = None) -> None:
     if build_id_for_deploy:
         dep["build_id"] = build_id_for_deploy
 
+    _print_params("POST /deployIndex (body)", dep)
     dr = _post_json(args.online_url, "/deployIndex", dep)
     print(json.dumps(dr, indent=2))
 

@@ -6,8 +6,12 @@
 // Table-specific configuration (kafka topic, etc.) lives in
 // {db_path}/{table_name}/table.json and is loaded dynamically.
 
+#include <algorithm>
+#include <cctype>
 #include <cstdint>
+#include <filesystem>
 #include <fstream>
+#include <iostream>
 #include <stdexcept>
 #include <string>
 
@@ -33,10 +37,13 @@ struct ServerConfig {
     std::string kafka_default_brokers;
 
     // Optional AF_UNIX path: send line `reload <table>` to reopen index after symlink swap.
+    // When omitted or empty, defaults to {parent of db_path}/admin.sock (same as pipeline WORK/admin.sock
+    // when db_path is WORK/server_db).
     std::string admin_unix_socket;
 };
 
 inline ServerConfig LoadServerConfig(const std::string& path) {
+    namespace fs = std::filesystem;
     std::ifstream f(path);
     if (!f) throw std::runtime_error("cannot open config file: " + path);
     nlohmann::json j;
@@ -64,6 +71,20 @@ inline ServerConfig LoadServerConfig(const std::string& path) {
 
     if (j.contains("admin_unix_socket"))
         cfg.admin_unix_socket = j["admin_unix_socket"].get<std::string>();
+
+    // Trim whitespace; treat all-blank as unset → default next to db tree root.
+    {
+        auto& s = cfg.admin_unix_socket;
+        const auto not_space = [](unsigned char c) { return !std::isspace(c); };
+        s.erase(s.begin(), std::find_if(s.begin(), s.end(), not_space));
+        s.erase(std::find_if(s.rbegin(), s.rend(), not_space).base(), s.end());
+    }
+    if (cfg.admin_unix_socket.empty()) {
+        fs::path dbp(cfg.db_path);
+        fs::path parent = dbp.has_parent_path() ? dbp.parent_path() : fs::path(".");
+        cfg.admin_unix_socket = (parent / "admin.sock").lexically_normal().string();
+        std::cerr << "config: admin_unix_socket not set; using default " << cfg.admin_unix_socket << "\n";
+    }
 
     if (cfg.arena_seg_gb == 0 || cfg.arena_max_gb == 0)
         throw std::runtime_error("arena_seg_gb and arena_max_gb must be positive");

@@ -1,0 +1,4 @@
+# tools/yikv_db_sample.py — RPC sampler (no protobuf pip package; manual wire wrap for FbRpcRequest)
+grpcio>=1.60.0
+flatbuffers>=23.5.0
+pyarrow>=14.0.0
