@@ -1,3 +1,4 @@
 nohup.out
 bazel*
 artifact-storage.yaml
+*.pyc
