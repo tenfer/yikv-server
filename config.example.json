@@ -6,5 +6,6 @@
   "exclusive_arena_lock": true,
   "kafka": {
     "default_brokers": "broker1:9092,broker2:9092"
-  }
+  },
+  "admin_unix_socket": "/var/run/yikv-admin.sock"
 }

@@ -4,9 +4,8 @@
 #include <ctime>
 #include <iostream>
 #include <stdexcept>
-
-#include <sys/inotify.h>
-#include <unistd.h>
+#include <string_view>
+#include <utility>
 
 #include "table_config.h"
 
@@ -17,9 +16,9 @@ namespace yikv_server {
 namespace fs = std::filesystem;
 
 static std::string WallTs() {
-    auto      now = std::chrono::system_clock::now();
-    std::time_t t = std::chrono::system_clock::to_time_t(now);
-    char buf[32];
+    auto        now = std::chrono::system_clock::now();
+    std::time_t t   = std::chrono::system_clock::to_time_t(now);
+    char        buf[32];
     std::strftime(buf, sizeof(buf), "%Y-%m-%d %H:%M:%S", std::localtime(&t));
     return buf;
 }
@@ -27,17 +26,23 @@ static std::string WallTs() {
 #define LOG_INF(msg) std::cerr << "[" << WallTs() << "][registry] " << msg << "\n"
 #define LOG_ERR(msg) std::cerr << "[" << WallTs() << "][registry] ERROR: " << msg << "\n"
 
+static constexpr const char kReloadSuffix[] = "~reload";
+
+static bool IsReservedReloadStagingDirName(std::string_view name) {
+    return name.size() >= sizeof(kReloadSuffix) - 1 &&
+           name.compare(name.size() - (sizeof(kReloadSuffix) - 1), sizeof(kReloadSuffix) - 1,
+                        kReloadSuffix) == 0;
+}
+
 // ─── ctor / dtor ─────────────────────────────────────────────────────────────
 
 TableRegistry::TableRegistry(fs::path db_path, std::string default_brokers)
     : db_path_(std::move(db_path)), default_brokers_(std::move(default_brokers)) {}
 
 TableRegistry::~TableRegistry() {
-    StopWatcher();
-    // Stop all KafkaSources before the KVIndexes are invalidated.
     std::unique_lock lk(mu_);
-    for (auto& [name, slot] : tables_) {
-        if (slot->kafka_src) slot->kafka_src->Stop();
+    for (auto& [name, head] : heads_) {
+        if (head->slot && head->slot->kafka_src) head->slot->kafka_src->Stop();
     }
 }
 
@@ -49,61 +54,49 @@ void TableRegistry::ScanAndLoad() {
         return;
     }
     for (const auto& entry : fs::directory_iterator(db_path_)) {
-        if (entry.is_directory()) {
-            LoadTable(entry.path());
-        }
+        if (!entry.is_directory()) continue;
+        const std::string leaf = entry.path().filename().string();
+        if (IsReservedReloadStagingDirName(leaf)) continue;
+        LoadTable(entry.path());
     }
-    LOG_INF("startup scan complete: " << tables_.size() << " table(s) loaded");
+    LOG_INF("startup scan complete: " << heads_.size() << " table(s) loaded");
 }
 
-// ─── LoadTable ───────────────────────────────────────────────────────────────
+std::string TableRegistry::ReloadStagingDbName(const std::string& logical_table) {
+    return logical_table + kReloadSuffix;
+}
 
-bool TableRegistry::LoadTable(const fs::path& table_dir) {
-    const std::string name = table_dir.filename().string();
-    if (name.empty() || name[0] == '.') return false;  // skip hidden dirs
-
-    {
-        std::shared_lock lk(mu_);
-        if (tables_.count(name)) return true;  // already loaded
-    }
-
-    // Open via DB. DB::OpenIndex recovers schema from the arena.
-    try {
-        yikv::db::DB::Instance().OpenIndex(name);
-    } catch (const std::exception& e) {
-        LOG_ERR("OpenIndex(" << name << ") failed: " << e.what());
-        return false;
-    }
-
-    yikv::index::KVIndex*       kv     = yikv::db::DB::Instance().GetKVIndex(name);
+std::shared_ptr<TableSlot> TableRegistry::BuildSlotAfterOpen(const std::string& logical_table,
+                                                             const std::string&     db_index_name,
+                                                             const fs::path& table_config_dir) {
+    yikv::index::KVIndex*       kv     = yikv::db::DB::Instance().GetKVIndex(db_index_name);
     const yikv::schema::Schema* schema = kv->schema();
     if (!kv || !schema) {
-        LOG_ERR("GetKVIndex(" << name << ") returned null");
-        return false;
+        LOG_ERR("GetKVIndex(" << db_index_name << ") returned null");
+        return nullptr;
     }
 
-    auto slot = std::make_unique<TableSlot>();
+    auto slot    = std::make_shared<TableSlot>();
     slot->kv     = kv;
     slot->schema = schema;
 
-    // Load per-table config (kafka).
     TableConfig tcfg;
     try {
-        tcfg = LoadTableConfig(table_dir);
+        tcfg = LoadTableConfig(table_config_dir);
     } catch (const std::exception& e) {
-        LOG_ERR("table.json error for " << name << ": " << e.what());
-        // Non-fatal: proceed without kafka.
+        LOG_ERR("table.json error for " << logical_table << ": " << e.what());
     }
 
     if (tcfg.kafka.has_value()) {
-        const auto& kc = *tcfg.kafka;
+        const auto&        kc      = *tcfg.kafka;
         const std::string& brokers = kc.brokers.empty() ? default_brokers_ : kc.brokers;
         if (brokers.empty()) {
-            LOG_ERR("no kafka brokers for table " << name << "; skipping KafkaSource");
+            LOG_ERR("no kafka brokers for table " << logical_table << "; skipping KafkaSource");
         } else {
             std::string offset_file =
-                (db_path_ / (name + "_" + kc.topic + "_" +
-                             std::to_string(kc.partition) + ".offset")).string();
+                (db_path_ / (logical_table + "_" + kc.topic + "_" +
+                             std::to_string(kc.partition) + ".offset"))
+                    .string();
             slot->kafka_src = std::make_unique<kafka::KafkaSource>(
                 kv, schema,
                 kafka::KafkaSource::Config{
@@ -113,88 +106,177 @@ bool TableRegistry::LoadTable(const fs::path& table_dir) {
                     .offset_file = std::move(offset_file),
                 });
             slot->kafka_src->Start();
-            LOG_INF("KafkaSource started for " << name
-                    << " topic=" << kc.topic << " partition=" << kc.partition);
+            LOG_INF("KafkaSource started for " << logical_table << " topic=" << kc.topic
+                                               << " partition=" << kc.partition);
         }
+    }
+
+    return slot;
+}
+
+// ─── LoadTable ───────────────────────────────────────────────────────────────
+
+bool TableRegistry::LoadTable(const fs::path& table_dir) {
+    const std::string name = table_dir.filename().string();
+    if (name.empty() || name[0] == '.') return false;
+    if (IsReservedReloadStagingDirName(name)) return false;
+
+    {
+        std::shared_lock lk(mu_);
+        if (heads_.count(name)) return true;
+    }
+
+    try {
+        yikv::db::DB::Instance().OpenIndex(name);
+    } catch (const std::exception& e) {
+        LOG_ERR("OpenIndex(" << name << ") failed: " << e.what());
+        return false;
+    }
+
+    std::error_code ec;
+    const fs::path  cfg_dir = fs::weakly_canonical(table_dir, ec);
+    if (ec) {
+        LOG_ERR("weakly_canonical(" << table_dir << ") failed: " << ec.message());
+        yikv::db::DB::Instance().CloseIndex(name);
+        return false;
+    }
+
+    auto slot = BuildSlotAfterOpen(name, name, cfg_dir);
+    if (!slot) {
+        yikv::db::DB::Instance().CloseIndex(name);
+        return false;
     }
 
     {
         std::unique_lock lk(mu_);
-        tables_[name] = std::move(slot);
+        if (heads_.count(name)) {
+            if (slot->kafka_src) slot->kafka_src->Stop();
+            yikv::db::DB::Instance().CloseIndex(name);
+            return true;
+        }
+        auto head                = std::make_unique<TableHead>();
+        head->slot            = std::move(slot);
+        head->staging_is_live = false;
+        heads_[name] = std::move(head);
     }
     LOG_INF("loaded table: " << name);
     return true;
 }
 
-// ─── Lookup ──────────────────────────────────────────────────────────────────
+// ─── Acquire / Reload ────────────────────────────────────────────────────────
 
-TableRegistry::TableSlot* TableRegistry::Lookup(const std::string& table_name) {
+std::optional<TableHandle> TableRegistry::Acquire(const std::string& table_name) {
     std::shared_lock lk(mu_);
-    auto it = tables_.find(table_name);
-    return (it != tables_.end()) ? it->second.get() : nullptr;
+    auto             it = heads_.find(table_name);
+    if (it == heads_.end()) return std::nullopt;
+    TableHead& h = *it->second;
+    std::shared_lock hlk(h.mu);
+    auto             sp = h.slot;
+    if (!sp) return std::nullopt;
+    return TableHandle(sp);
 }
 
-// ─── inotify watcher ─────────────────────────────────────────────────────────
-
-void TableRegistry::StartWatcher() {
-    inotify_fd_ = inotify_init1(IN_NONBLOCK);
-    if (inotify_fd_ < 0) {
-        LOG_ERR("inotify_init1 failed; hot-add disabled");
-        return;
-    }
-    // Watch for new directories created/moved into db_path_.
-    if (inotify_add_watch(inotify_fd_, db_path_.c_str(),
-                          IN_CREATE | IN_MOVED_TO) < 0) {
-        LOG_ERR("inotify_add_watch failed on " << db_path_);
-        close(inotify_fd_);
-        inotify_fd_ = -1;
-        return;
-    }
-    watcher_thread_ = std::thread(&TableRegistry::WatchLoop, this);
-    LOG_INF("inotify watcher started on " << db_path_);
-}
-
-void TableRegistry::StopWatcher() {
-    stop_watcher_.store(true, std::memory_order_relaxed);
-    if (inotify_fd_ >= 0) {
-        close(inotify_fd_);
-        inotify_fd_ = -1;
-    }
-    if (watcher_thread_.joinable()) watcher_thread_.join();
-}
-
-void TableRegistry::WatchLoop() {
-    constexpr size_t kBufSz = sizeof(inotify_event) + NAME_MAX + 1;
-    alignas(inotify_event) char buf[kBufSz * 8];
-
-    while (!stop_watcher_.load(std::memory_order_relaxed)) {
-        // inotify_fd_ is non-blocking; sleep briefly between polls.
-        ssize_t n = read(inotify_fd_, buf, sizeof(buf));
-        if (n <= 0) {
-            if (stop_watcher_.load(std::memory_order_relaxed)) break;
-            std::this_thread::sleep_for(std::chrono::milliseconds(200));
-            continue;
-        }
-
-        for (char* p = buf; p < buf + n; ) {
-            auto* ev = reinterpret_cast<inotify_event*>(p);
-            p += sizeof(inotify_event) + ev->len;
-
-            if (!(ev->mask & (IN_CREATE | IN_MOVED_TO))) continue;
-            if (!(ev->mask & IN_ISDIR))                  continue;
-            if (ev->len == 0)                             continue;
-
-            const std::string dir_name(ev->name);
-            // Give the build tool a moment to finish writing all files.
-            std::this_thread::sleep_for(std::chrono::seconds(2));
-
-            const fs::path new_dir = db_path_ / dir_name;
-            if (fs::is_directory(new_dir)) {
-                LOG_INF("new table directory detected: " << dir_name);
-                LoadTable(new_dir);
-            }
+void TableRegistry::ReloadTable(const std::string& table_name) {
+    {
+        std::shared_lock lk(mu_);
+        if (heads_.find(table_name) == heads_.end()) {
+            lk.unlock();
+            if (IsReservedReloadStagingDirName(table_name))
+                throw std::runtime_error("ReloadTable: reserved name suffix: " + table_name);
+            const fs::path dir = db_path_ / table_name;
+            if (!fs::is_directory(dir))
+                throw std::runtime_error("ReloadTable: not a directory: " + dir.string());
+            if (!LoadTable(dir))
+                throw std::runtime_error("ReloadTable: failed to open new table: " + table_name);
+            LOG_INF("reload: hot-opened new table " << table_name);
+            return;
         }
     }
+
+    TableHead* head = nullptr;
+    {
+        std::shared_lock lk(mu_);
+        auto             it = heads_.find(table_name);
+        if (it == heads_.end())
+            throw std::runtime_error("ReloadTable: race lost table: " + table_name);
+        head = it->second.get();
+    }
+
+    std::lock_guard<std::mutex> reload_serial_lock(head->reload_serial);
+
+    bool live_on_staging;
+    {
+        std::shared_lock hlk(head->mu);
+        if (!head->slot) throw std::runtime_error("ReloadTable: empty slot: " + table_name);
+        live_on_staging = head->staging_is_live;
+    }
+
+    const std::string stg               = ReloadStagingDbName(table_name);
+    const bool        open_staging_next = !live_on_staging;
+    const std::string next_db           = open_staging_next ? stg : table_name;
+    const std::string prev_db           = open_staging_next ? table_name : stg;
+
+    const fs::path primary = db_path_ / table_name;
+    std::error_code  ec;
+    const fs::path   table_config_dir = fs::weakly_canonical(primary, ec);
+    if (ec)
+        throw std::runtime_error("ReloadTable: weakly_canonical(" + primary.string() + "): " +
+                                 ec.message());
+
+    if (next_db != table_name) {
+        const fs::path link_path = db_path_ / next_db;
+        fs::remove(link_path, ec);
+        fs::create_symlink(table_config_dir, link_path, ec);
+        if (ec)
+            throw std::runtime_error("ReloadTable: create_symlink " + link_path.string() + ": " +
+                                     ec.message());
+    }
+
+    try {
+        yikv::db::DB::Instance().OpenIndex(next_db);
+    } catch (...) {
+        if (next_db != table_name) {
+            fs::remove(db_path_ / next_db, ec);
+        }
+        throw;
+    }
+
+    auto new_slot = BuildSlotAfterOpen(table_name, next_db, table_config_dir);
+    if (!new_slot) {
+        yikv::db::DB::Instance().CloseIndex(next_db);
+        if (next_db != table_name) fs::remove(db_path_ / next_db, ec);
+        throw std::runtime_error("ReloadTable: rebuild slot failed: " + table_name);
+    }
+
+    std::shared_ptr<TableSlot> old_sp;
+    {
+        std::unique_lock hlk(head->mu);
+        old_sp                  = head->slot;
+        head->slot              = std::move(new_slot);
+        head->staging_is_live = open_staging_next;
+    }
+
+    LOG_INF("reload: live swap " << table_name << " -> db key \"" << next_db << "\"");
+
+    if (old_sp && old_sp->kafka_src) old_sp->kafka_src->Stop();
+
+    for (int i = 0;; ++i) {
+        if (old_sp.use_count() == 1) break;
+        if (i > 0 && (i % 500) == 0)
+            LOG_INF("reload: waiting for in-flight RPCs on old slot " << table_name << "...");
+        std::this_thread::sleep_for(std::chrono::milliseconds(2));
+    }
+
+    old_sp.reset();
+    yikv::db::DB::Instance().CloseIndex(prev_db);
+
+    if (prev_db != table_name) {
+        fs::remove(db_path_ / prev_db, ec);
+        if (ec)
+            LOG_ERR("reload: remove " << prev_db << ": " << ec.message());
+    }
+
+    LOG_INF("reload: closed previous key \"" << prev_db << "\" for " << table_name);
 }
 
 }  // namespace yikv_server

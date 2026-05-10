@@ -1,0 +1,23 @@
+# Copy to artifact-storage.yaml (gitignored) and edit.
+# Single file switches local dir vs S3-compatible cloud (OSS/OBS/COS/S3/MinIO) without changing pipeline commands.
+
+# 示例：表 dsp_test4 构建产物目录常为 /data/yikv_data/dsp_test4（见 README「示例」）。
+
+provider: local
+env: dev
+key_prefix: yikv-index
+
+local:
+  root: /data/yikv-artifact-store
+
+# --- S3-compatible (uncomment and set provider: s3_compatible) ---
+# provider: s3_compatible
+# env: prod
+# key_prefix: yikv-index
+# s3_compatible:
+#   bucket: my-bucket
+#   region: oss-cn-hangzhou
+#   endpoint: https://oss-cn-hangzhou.aliyuncs.com
+#   access_key_id_env: OSS_ACCESS_KEY_ID
+#   secret_access_key_env: OSS_ACCESS_KEY_SECRET
+#   # force_path_style: true

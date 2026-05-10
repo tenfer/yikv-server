@@ -4,9 +4,13 @@
 //   yikv_server config.json
 //
 // Per-table config (kafka topic, etc.) lives in {db_path}/{table_name}/table.json
-// and is loaded automatically on startup. New tables dropped into db_path are
-// detected by inotify and hot-loaded without restarting the server.
+// and is loaded at startup (ScanAndLoad). New directories after start can be
+// opened via admin «reload <table_name>» (same as first-time load).
+//
+// After switching artifact «active» for an existing table, send reload on
+// admin_unix_socket (see config) to remap mmap without process restart.
 
+#include "admin_unix_socket.h"
 #include "rpc/db_brpc_service.h"
 #include "rpc/db_grpc_service.h"
 #include "server_config.h"
@@ -55,8 +59,7 @@ int main(int argc, char** argv) {
         std::cerr << "WARNING: no tables found under " << cfg.db_path << "\n";
     }
 
-    // Hot-add: inotify watch on db_path for new table directories.
-    reg.StartWatcher();
+    yikv_server::StartAdminUnixSocket(cfg.admin_unix_socket, &reg);
 
     // ── RPC services ──────────────────────────────────────────────────────────
     yikv_server::rpc::YikvDbGrpcService grpc_svc(&reg);
@@ -79,6 +82,5 @@ int main(int argc, char** argv) {
 
     server.RunUntilAskedToQuit();
 
-    reg.StopWatcher();
     return 0;
 }

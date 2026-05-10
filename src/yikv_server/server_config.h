@@ -31,6 +31,9 @@ struct ServerConfig {
 
     // Global default Kafka brokers; individual table.json can override.
     std::string kafka_default_brokers;
+
+    // Optional AF_UNIX path: send line `reload <table>` to reopen index after symlink swap.
+    std::string admin_unix_socket;
 };
 
 inline ServerConfig LoadServerConfig(const std::string& path) {
@@ -58,6 +61,9 @@ inline ServerConfig LoadServerConfig(const std::string& path) {
 
     if (j.contains("kafka") && j["kafka"].contains("default_brokers"))
         cfg.kafka_default_brokers = j["kafka"]["default_brokers"].get<std::string>();
+
+    if (j.contains("admin_unix_socket"))
+        cfg.admin_unix_socket = j["admin_unix_socket"].get<std::string>();
 
     if (cfg.arena_seg_gb == 0 || cfg.arena_max_gb == 0)
         throw std::runtime_error("arena_seg_gb and arena_max_gb must be positive");

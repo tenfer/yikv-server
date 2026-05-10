@@ -8,6 +8,7 @@
 #include "src/schema/schema.h"
 
 #include <cstring>
+#include <optional>
 #include <string_view>
 #include <vector>
 
@@ -18,6 +19,8 @@ using yikv::index::KVIndex;
 using yikv::schema::DataType;
 using yikv::schema::FieldDef;
 using yikv::schema::Schema;
+using ::yikv_server::TableHandle;
+using ::yikv_server::TableSlot;
 
 // ─── Internal helpers ─────────────────────────────────────────────────────────
 
@@ -221,22 +224,23 @@ flatbuffers::Offset<yidiandb::Row> BuildRow(flatbuffers::FlatBufferBuilder& fbb,
 
 // ─── Table lookup helper ─────────────────────────────────────────────────────
 
-static TableRegistry::TableSlot* LookupOrError(
-    TableRegistry*                 reg,
-    const flatbuffers::String*     tname_fb,
+template <typename ErrFn>
+static std::optional<TableHandle> AcquireOrError(
+    TableRegistry*                  reg,
+    const flatbuffers::String*      tname_fb,
     flatbuffers::FlatBufferBuilder& fbb,
-    std::string*                   out_resp,
-    auto                           make_error_resp) {
+    std::string*                    out_resp,
+    ErrFn                           make_error_resp) {
     if (!tname_fb || tname_fb->size() == 0) {
         make_error_resp(fbb, "missing table_name in request", out_resp);
-        return nullptr;
+        return std::nullopt;
     }
-    TableRegistry::TableSlot* slot = reg->Lookup(tname_fb->str());
-    if (!slot) {
+    auto h = reg->Acquire(tname_fb->str());
+    if (!h) {
         make_error_resp(fbb, "unknown table: " + tname_fb->str(), out_resp);
-        return nullptr;
+        return std::nullopt;
     }
-    return slot;
+    return h;
 }
 
 // ─── HandleGet ───────────────────────────────────────────────────────────────
@@ -255,9 +259,9 @@ void HandleGet(TableRegistry* reg, const void* req, size_t req_len, std::string*
 
     if (!preq || !preq->pk()) { error_resp(fbb, "missing pk", out_resp); return; }
 
-    TableRegistry::TableSlot* slot =
-        LookupOrError(reg, preq->table_name(), fbb, out_resp, error_resp);
-    if (!slot) return;
+    auto h = AcquireOrError(reg, preq->table_name(), fbb, out_resp, error_resp);
+    if (!h) return;
+    TableSlot& slot = **h;
 
     std::string pk = preq->pk()->str();
     Doc         out_doc;
@@ -265,7 +269,7 @@ void HandleGet(TableRegistry* reg, const void* req, size_t req_len, std::string*
     bool        hit;
     {
         auto t0 = std::chrono::steady_clock::now();
-        hit     = slot->kv->Get(pk, &out_doc);
+        hit     = slot.kv->Get(pk, &out_doc);
         ns      = static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
                       std::chrono::steady_clock::now() - t0).count());
     }
@@ -273,7 +277,7 @@ void HandleGet(TableRegistry* reg, const void* req, size_t req_len, std::string*
     if (!hit) {
         fbb.Finish(yidiandb::CreateGetResponse(fbb, false, er, 0, ns));
     } else {
-        auto row = BuildRow(fbb, out_doc, slot->schema);
+        auto row = BuildRow(fbb, out_doc, slot.schema);
         fbb.Finish(yidiandb::CreateGetResponse(fbb, true, er, row, ns));
     }
     out_resp->assign(reinterpret_cast<const char*>(fbb.GetBufferPointer()), fbb.GetSize());
@@ -295,21 +299,21 @@ void HandlePut(TableRegistry* reg, const void* req, size_t req_len, std::string*
 
     if (!preq || !preq->row()) { error_resp(fbb, "missing row", out_resp); return; }
 
-    TableRegistry::TableSlot* slot =
-        LookupOrError(reg, preq->table_name(), fbb, out_resp, error_resp);
-    if (!slot) return;
+    auto h = AcquireOrError(reg, preq->table_name(), fbb, out_resp, error_resp);
+    if (!h) return;
+    TableSlot& slot = **h;
 
     {
-        std::lock_guard lk(slot->write_mu);
-        Doc doc = slot->kv->NewDoc();
-        HandlerStatus st = ApplyRowToDoc(&doc, preq->row(), slot->schema);
+        std::lock_guard lk(slot.write_mu);
+        Doc doc = slot.kv->NewDoc();
+        HandlerStatus st = ApplyRowToDoc(&doc, preq->row(), slot.schema);
         if (!st.ok) { error_resp(fbb, st.err, out_resp); return; }
-        std::string pk = ExtractPkString(doc, slot->schema);
+        std::string pk = ExtractPkString(doc, slot.schema);
         if (pk.empty()) {
             error_resp(fbb, "cannot derive pk (check pk field type in schema)", out_resp);
             return;
         }
-        slot->kv->Upsert(&doc);
+        slot.kv->Upsert(&doc);
     }
     auto es = fbb.CreateString("");
     fbb.Finish(yidiandb::CreatePutResponse(fbb, true, es));
@@ -332,24 +336,24 @@ void HandlePutBatch(TableRegistry* reg, const void* req, size_t req_len, std::st
 
     if (!preq || !preq->rows()) { error_resp(fbb, "missing rows", out_resp); return; }
 
-    TableRegistry::TableSlot* slot =
-        LookupOrError(reg, preq->table_name(), fbb, out_resp, error_resp);
-    if (!slot) return;
+    auto h = AcquireOrError(reg, preq->table_name(), fbb, out_resp, error_resp);
+    if (!h) return;
+    TableSlot& slot = **h;
 
     const auto* rows = preq->rows();
     if (rows->size() == 0) { error_resp(fbb, "empty batch", out_resp); return; }
 
     {
-        std::lock_guard lk(slot->write_mu);
+        std::lock_guard lk(slot.write_mu);
         std::vector<Doc> staged;
         staged.reserve(rows->size());
         for (flatbuffers::uoffset_t i = 0; i < rows->size(); ++i) {
             const yidiandb::Row* row = rows->Get(i);
             if (!row) { error_resp(fbb, "null row in batch", out_resp); return; }
-            Doc doc = slot->kv->NewDoc();
-            HandlerStatus st = ApplyRowToDoc(&doc, row, slot->schema);
+            Doc doc = slot.kv->NewDoc();
+            HandlerStatus st = ApplyRowToDoc(&doc, row, slot.schema);
             if (!st.ok) { error_resp(fbb, st.err, out_resp); return; }
-            std::string pk = ExtractPkString(doc, slot->schema);
+            std::string pk = ExtractPkString(doc, slot.schema);
             if (pk.empty()) {
                 error_resp(fbb, "cannot derive pk", out_resp);
                 return;
@@ -359,7 +363,7 @@ void HandlePutBatch(TableRegistry* reg, const void* req, size_t req_len, std::st
         std::vector<Doc*> ptrs;
         ptrs.reserve(staged.size());
         for (auto& doc : staged) ptrs.push_back(&doc);
-        slot->kv->BatchUpsert(ptrs);
+        slot.kv->BatchUpsert(ptrs);
     }
     auto es = fbb.CreateString("");
     fbb.Finish(yidiandb::CreatePutBatchResponse(fbb, true, es));
@@ -382,9 +386,9 @@ void HandleBatchGet(TableRegistry* reg, const void* req, size_t req_len, std::st
 
     if (!preq || !preq->pks()) { error_resp(fbb, "missing pks", out_resp); return; }
 
-    TableRegistry::TableSlot* slot =
-        LookupOrError(reg, preq->table_name(), fbb, out_resp, error_resp);
-    if (!slot) return;
+    auto h = AcquireOrError(reg, preq->table_name(), fbb, out_resp, error_resp);
+    if (!h) return;
+    TableSlot& slot = **h;
 
     std::vector<flatbuffers::Offset<yidiandb::Row>> row_offs;
     const auto* pks = preq->pks();
@@ -392,10 +396,10 @@ void HandleBatchGet(TableRegistry* reg, const void* req, size_t req_len, std::st
         const auto* pk_s = pks->Get(i);
         if (!pk_s) { row_offs.push_back(yidiandb::CreateRow(fbb, 0)); continue; }
         Doc out_doc;
-        if (!slot->kv->Get(pk_s->str(), &out_doc))
+        if (!slot.kv->Get(pk_s->str(), &out_doc))
             row_offs.push_back(yidiandb::CreateRow(fbb, 0));
         else
-            row_offs.push_back(BuildRow(fbb, out_doc, slot->schema));
+            row_offs.push_back(BuildRow(fbb, out_doc, slot.schema));
     }
     auto es = fbb.CreateString("");
     fbb.Finish(yidiandb::CreateBatchGetResponse(fbb, fbb.CreateVector(row_offs), es));

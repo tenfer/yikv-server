@@ -1,116 +1,95 @@
-# yikv-server（yidiandb）
+# yikv-server 技术说明（db.md）
 
-基于 [yikv](../yikv) 的 KV 存储，对外在同一监听地址上提供 **双栈** 读写：**brpc `baidu_std` + `BaiduMasterService`（SerializedRequest 承载 FlatBuffers）**，以及 **标准 gRPC `h2:grpc`**（[`proto/yikv_grpc.proto`](proto/yikv_grpc.proto) 的 `FbRpcRequest/FbRpcResponse.payload` 内仍为 FlatBuffers）。离线 bulk 导入由 **`yikv_import_pipeline`** 完成（Parquet/CSV、云 URI、MySQL 协议等，见下文）。
+面向实现与排错；**安装、命令速查、流程导读**见 **[`README.md`](README.md)**。
 
-`yikv_import_pipeline` 提供 **多 IO 线程读/解析 + 单线程 `NewDoc`/`BatchPut`**（含 **oss:// / s3://** 等与 **MySQL 协议**拉数），与 `yikv_server` 共用 `config.json`，默认 **`AllocatorMode::SingleWriter`**；详见「通用导入流水线」。表 **`schema.json`** 由业务维护或从列名对照手写，参见仓库内 [`schema.json`](schema.json) 示例。
+---
 
-## 依赖
+## 1. 概述
 
-**C++ 服务（Bazel）**
+- **存储引擎**：同级目录 [yikv](../yikv)，mmap arena + `KVIndex`（主键 → 文档）。
+- **进程 `yikv_server`**：在 **`listen`** 上同时提供 **brpc `baidu_std`** 与 **gRPC `h2:grpc`**，业务载荷均为 **FlatBuffers**（[`proto/yikv_server.fbs`](proto/yikv_server.fbs)）。
+- **离线 bulk**：唯一入口 **`yikv_import_pipeline`**（Parquet/CSV、云 URI、MySQL 线协议）；与服务器共用 **`config.json`**，写路径默认 **`AllocatorMode::SingleWriter`**。
+- **实时增量（可选）**：每表 **`table.json`** + **`KafkaSource`**，消息为 JSON（见 §6）。
 
-- 本仓库 `MODULE.bazel` 拉取 **Apache brpc 1.16.0**、与 yikv 对齐的 **protobuf / leveldb** 等；系统 **OpenSSL**（`-lssl -lcrypto`）。
-- **系统库**：`libflatbuffers-dev`（与 `deps/include` 头一致即可）、Parquet 压测需 **Apache Arrow C++ / Parquet**（`libarrow-dev` `libparquet-dev`）。
+---
 
-**Python（可选，仅 FlatBuffers 生成 Python 绑定）**
+## 2. 环境与构建
 
-若需 `flatc --python`，可 `pip install flatbuffers`。
+**Bazel**：[`MODULE.bazel`](MODULE.bazel)、[`.bazelversion`](.bazelversion)。拉取 **brpc**、与 yikv 对齐的 **protobuf / leveldb** 等。
 
-FlatBuffers 生成：
+**系统**
+
+- **OpenSSL**（`-lssl -lcrypto`）。
+- **FlatBuffers**：`libflatbuffers-dev` 或与 [`deps/include`](deps/include) 一致的头文件；C++ 生成物为 [`gen/yikv_server_generated.h`](gen/yikv_server_generated.h)。
+- **Arrow / Parquet**：导入与 `yikv_server_bench` 的 Parquet 键源需要 `libarrow-dev`、`libparquet-dev`（或等价）。
+- **MySQL 源**：`libmysqlclient-dev` + 运行时 `libmysqlclient.so`。
+
+**生成 FlatBuffers（可选 Python 绑定）**
 
 ```bash
+pip install flatbuffers   # 仅当需要 flatc --python 运行时
 flatc --python -o gen_py proto/yikv_server.fbs
 flatc --cpp -o gen proto/yikv_server.fbs
 ```
 
-`flatc --cpp` 会写出 `gen/yikv_server_generated.h`（与 C++ `#include "yikv_server_generated.h"` 一致）。
-
-## 离线导入 CLI（`yikv_import_pipeline`）
-
-**`yikv_import_pipeline`** 与 **`yikv_server` 共用同一份 `config.json`**：`db_path`、`arena_seg_gb`、`arena_max_gb`（及 `exclusive_arena_lock`）**只能**从 JSON 读取，**不能**通过命令行传入。导入直连 `KVIndex::BatchPut` 等；导入前须停止已打开该库的服务器进程（默认 `arena.lock` 互斥）。
+**构建目标**
 
 ```bash
-bazel build //:yikv_import_pipeline
-./bazel-bin/yikv_import_pipeline \
-  --config /path/to/config.json \
-  --index dsp_test \
-  --input /data/part1.parquet \
-  --import_io_workers 4
+bazel build //:yikv_server //:yikv_import_pipeline //:yikv_server_bench
 ```
 
-递归目录 **`--input_dir`** 会收集 **`.parquet` 与 `.csv`**（路径排序）；可与多个 `--input`、`--input_list` 混用。常用：`--schema_json`、`--create_if_missing`、`--recreate`、`--no_arena_lock`；吞吐相关：`--import_io_workers`、`--import_queue_batches`。云路径、MySQL 见 [`README.md`](README.md)。
+---
 
-**容量**：主键 HashMap 单索引约可支撑 **数千万级** 唯一主键（随 yikv 版本而变）。用旧版 yikv 建的索引目录（HashMap v1）在本库升级后 **无法直接打开**，需删掉该 `--index` 对应目录后 `--create_if_missing` 重建并全量重导。
+## 3. 全局配置与表目录
 
-服务进程从 **唯一参数** 读取全局配置（表级配置在各表目录 `table.json`）：
+**`config.json`**（与 [`config.example.json`](config.example.json) 对齐）由 **`yikv_server`** 与 **`yikv_import_pipeline`** 共用。其中 **`db_path`、`arena_seg_gb`、`arena_max_gb`、`exclusive_arena_lock`** 只能从 JSON 读取，**禁止**在导入 CLI 覆盖，以免与线上不一致。
 
-```bash
-bazel run //:yikv_server -- /path/to/config.json
-```
+| 键 | 说明 |
+|----|------|
+| `db_path` | 库根路径 |
+| `listen` | 默认 `0.0.0.0:9000` |
+| `arena_seg_gb` / `arena_max_gb` | arena 单段与总上限 (GiB) |
+| `exclusive_arena_lock` | `true` 时对 `arena.lock` 排他；导入与服务勿并发写 |
+| `kafka.default_brokers` | 全局 Kafka；表级可覆盖 |
+| `admin_unix_socket` | 可选；本机 **AF_UNIX** 监听路径。连上后发送一行 **`reload <表名>`**（可带换行）。**表已在内存**：在备用 DB 键上 **`OpenIndex`**（`表名` 与 `表名~reload` 交替）、切换 live `TableSlot` 后新请求即走新 mmap，再在途 RPC 结束后 **`CloseIndex`** 旧键。**表尚未加载**：对 `{db_path}/{表名}/` 做首次打开，等价启动时的 `LoadTable`（当前只有一单版本，不做双缓冲）。磁盘上 **`{db_path}/*~reload`** 为内部预留，勿作业务表名。 |
 
-| `yikv_import_pipeline`（文件模式节选） | 含义 |
+**表目录**：`{db_path}/{表名}/`（可为符号链接，例如指向某 release 根下的 `active`。）
+
+| 路径 | 说明 |
 |------|------|
-| `--config` | 与 `yikv_server` 相同的 `config.json` |
-| `--index` | 表/索引名（`{db_path}/{index}/`） |
-| `--input` / `--input_list` / `--input_dir` | 本地或云 Parquet/CSV |
-| `--schema_json` / `--create_if_missing` / `--recreate` | 建表与重建 |
-| `--no_arena_lock` | 本次运行跳过 arena 文件锁（慎用） |
-| `--import_io_workers` / `--import_queue_batches` | 并行读解析与队列深度 |
+| arena 文件等 | 由 yikv / 导入工具维护 |
+| `schema.json` | 字段、`pk`、类型 |
+| `table.json` | 可选；Kafka `topic`、`partition`、`brokers` |
 
-全局 `config.json` 键说明见 [`config.example.json`](config.example.json)、[`README.md`](README.md)。
+服务启动时对 `db_path` 做一次扫描并打开子目录表（**跳过**以 *`~reload` 结尾的目录名**，内部热重载预留）。**运行期中**若有新的 `{db_path}/{表名}/`，可发 **`reload <表名>`** 做首次打开，无需重启。已加载的表在换盘侧 **`active`** 变更后同样发 **`reload <表名>`** 跟到新目录。
 
-**RPC 契约（双栈，同一 `listen`）**
+---
 
-### 1) brpc `baidu_std`（原路径）
+## 4. RPC 契约（双栈）
 
-- **协议**：`baidu_std`
+### 4.1 brpc `baidu_std`
+
 - **Service（meta）**：`yikv.db.YikvDb`
-- **Methods**：`Get` / `Put` / `PutBatch` / `BatchGet`
-- **请求/响应体**：FlatBuffers 根表分别为 `GetRequest`↔`GetResponse` 等；放在 **`SerializedRequest.serialized_data` / `SerializedResponse.serialized_data`**（裸 `Finish` 字节，无 protobuf 嵌套）。
+- **方法**：`Get` / `Put` / `PutBatch` / `BatchGet`
+- **体**：FlatBuffers 根表 `GetRequest`↔`GetResponse` 等，置于 **`SerializedRequest.serialized_data` / `SerializedResponse.serialized_data`**（裸 `Finish` 字节）。
 
-### 2) 标准 gRPC `h2:grpc`（方案 B：Protobuf 外壳 + FlatBuffers 载荷）
+### 4.2 gRPC `h2:grpc`
 
-- **Protobuf**：[`proto/yikv_grpc.proto`](proto/yikv_grpc.proto)，`option cc_generic_services = true`。
-- **gRPC service 全名**：`yikv.db.YikvDb`，方法名：`Get` / `Put` / `PutBatch` / `BatchGet`。
-- **消息**：`FbRpcRequest.payload`、`FbRpcResponse.payload` 为 **bytes**，内容与 1) 中 FlatBuffers 完全一致（`proto/yikv_server.fbs` 根表）。
-- **客户端**：任意语言官方 gRPC + 由 `yikv_grpc.proto` 生成的 Stub；C++ 也可用 brpc：`ChannelOptions.protocol = "h2:grpc"` + `yikv::db::YikvDb_Stub`（参见 brpc `example/grpc_c++/client.cpp` 写法）。
+- **Proto**：[`proto/yikv_grpc.proto`](proto/yikv_grpc.proto)，`option cc_generic_services = true`
+- **全名**：`yikv.db.YikvDb`（方法名同上）
+- **`FbRpcRequest.payload` / `FbRpcResponse.payload`**：与 4.1 **完全相同**的 FlatBuffers 字节
 
-表定义见 [`proto/yikv_server.fbs`](proto/yikv_server.fbs)。
+**客户端**：任意语言 gRPC + 由 `yikv_grpc.proto` 生成的 Stub；C++ 也可用 brpc：`ChannelOptions.protocol = "h2:grpc"` + `yikv::db::YikvDb_Stub`（参考 brpc `example/grpc_c++/client.cpp`）。
 
-**PutBatch**：整批原子语义——任一行校验失败则整批返回 `ok=false` 且不 `Publish`；全部成功后一次 `Publish()`。空批或缺失 `rows` 返回错误。
+**PutBatch**：整批原子——任一行失败则整批 `ok=false` 且不 `Publish`；全部成功后一次 `Publish()`。空批或缺 `rows` 报错。
 
-## 客户端压测（C++）
+---
 
-```bash
-bazel run //:yikv_server_bench -- \
-  --server 127.0.0.1:8000 \
-  --keys_file ./pks.txt \
-  --workers 8 \
-  --requests 50000
-```
+## 5. 离线导入：`yikv_import_pipeline`
 
-支持 `--local_parquet` + `--pk`；兼容旧参数名 **`--grpc_target`**（等同于 `--server`）。输出 JSON 中含 `qps`、延迟分位、`index_get`（服务端 `GetResponse.index_get_ns` 汇总）。
+### 5.1 架构（单写 + 有界队列）
 
-## OSS / 云路径 Parquet、CSV
-
-配置环境变量后，可直接用 **`yikv_import_pipeline`** 传 **`oss://bucket/prefix/`** 或具体对象 URI（见 [`README.md`](README.md)）。无需再经 Python 中转落盘。`schema.json` 与列名对齐后 **`--create_if_missing`** 建表即可。
-
-## 布局
-
-- [`proto/yikv_server.fbs`](proto/yikv_server.fbs) — FlatBuffers 契约
-- [`proto/yikv_db_wire.proto`](proto/yikv_db_wire.proto) — brpc meta 名称文档（`//:yikv_db_wire_proto`）
-- [`proto/yikv_grpc.proto`](proto/yikv_grpc.proto) — 标准 gRPC（`h2:grpc`）`yikv.db.YikvDb`，`payload` 内为 FlatBuffers
-- [`src/yikv_server/main.cc`](src/yikv_server/main.cc) — 进程入口、`brpc::Server`
-- [`src/yikv_server/rpc/db_brpc_service.cc`](src/yikv_server/rpc/db_brpc_service.cc) — `BaiduMasterService` 分发
-- [`src/yikv_server/rpc/db_grpc_service.cc`](src/yikv_server/rpc/db_grpc_service.cc) — Protobuf `yikv.db.YikvDb`（gRPC）
-- [`src/yikv_server/db/handlers.cc`](src/yikv_server/db/handlers.cc) — 索引与 FlatBuffers 编解码
-- [`gen/yikv_server_generated.h`](gen/yikv_server_generated.h) — `flatc` 自 `proto/yikv_server.fbs` 生成（C++ 唯一入口）
-- [`src/bench_main.cc`](src/bench_main.cc) — brpc Get 压测
-- [`src/import_pipeline_main.cc`](src/import_pipeline_main.cc) — `//:yikv_import_pipeline`
-- [`src/import/arrow_doc_helpers.cc`](src/import/arrow_doc_helpers.cc) — Arrow 列 → `Doc` 字段（`yikv_import` / 导入流水线写侧）
-
-## 通用导入流水线（Phase A：`yikv_import_pipeline`）
-
-**目标**：在 **单写 yikv 模型** 下并行 **I/O 与解析**，把 **`arrow::RecordBatch`** 经 **一条有界队列** 交给 **唯一写线程** 做 `NewDoc`、填字段与 `BatchPut`。队列里 **不出现** 跨线程的 `Doc*`。
+多 **Source** 线程（文件 claim 或 MySQL 单连接仅一线程真正拉流）产出 **`arrow::RecordBatch`**，经 **`BoundedParsedBatchQueue`** 由 **唯一写线程** 执行 `NewDoc`、列填充、`BatchPut`。队列中不传递跨线程的 `Doc*`。
 
 ```mermaid
 flowchart LR
@@ -119,35 +98,136 @@ flowchart LR
     P2[read_parse_batch]
   end
   subgraph q [Bounded_queue]
-    Q1[RecordBatch_batches]
+    Q1[RecordBatch]
   end
   subgraph w [Single_writer]
-    SW[NewDoc_fill_BatchPut]
+    SW[NewDoc_BatchPut]
   end
   P1 --> Q1
   P2 --> Q1
   Q1 --> SW
 ```
 
-构建与运行示例：
+- **统一写侧**：[`src/import/arrow_doc_helpers.cc`](src/import/arrow_doc_helpers.cc)（Arrow → `Doc`）
+- **文件 / 云**：[`src/indexer/source/file/file_source.cc`](src/indexer/source/file/file_source.cc)、[`cloud_filesystem.cc`](src/indexer/source/file/cloud_filesystem.cc)
+- **MySQL 线协议**：[`src/indexer/source/sql/mysql_wire_source.cc`](src/indexer/source/sql/mysql_wire_source.cc)
+- **入口**：[`src/import_pipeline_main.cc`](src/import_pipeline_main.cc)
 
-```bash
-bazel build //:yikv_import_pipeline
-./bazel-bin/yikv_import_pipeline \
-  --config /path/to/config.json \
-  --index dsp_test \
-  --input_dir /data/oss/all \
-  --import_io_workers 4 \
-  --import_queue_batches 32
-```
+**schema**：列名须与 `schema.json` 一致（**不区分大小写**）；CSV / MySQL **不支持数组字段**。新建索引时 **`bucket_bits`** 由估计行数推导；文件模式用 Parquet 元数据 / CSV 行数，MySQL 模式用 **`--sql_est_rows`**（可填 `COUNT(*)`）。
 
-文件模式 CLI：`--config`、`--index`、`--input` / `--input_list` / `--input_dir`、`--schema_json`、`--create_if_missing`、`--recreate`、`--no_arena_lock`。增量参数：
+**容量与兼容**：单索引主键规模随 yikv 版本变化（约数千万级量级）。**旧版 HashMap v1** 目录升级后可能无法打开，需删表目录后 `--create_if_missing` 全量重导。
+
+### 5.2 CLI 摘录
 
 | 标志 | 含义 |
 |------|------|
-| `--import_io_workers` | 并行读/解析为 `RecordBatch` 的线程数（默认 4；MySQL 单连接时多余线程空闲） |
-| `--import_queue_batches` | 队列中最多缓存的批次数（默认 32；满则阻塞生产者，背压） |
+| `--config` | 与服务器相同的 `config.json` |
+| `--index` | 表名 → `{db_path}/{index}/` |
+| `--input` / `--input_list` / `--input_dir` | 本地或云 Parquet/CSV |
+| `--schema_json` / `--create_if_missing` / `--recreate` | 建表 / 重建 |
+| `--no_arena_lock` | 本次跳过 flock（慎用） |
+| `--import_io_workers` | 默认 4；MySQL 单连接时仅一线程工作 |
+| `--import_queue_batches` | 队列批上限，默认 32（背压） |
+| `--mysql_*` / `--mysql_query_file` | MySQL 兼容源；详见 [`examples/mysql_import/README.md`](examples/mysql_import/README.md) |
+| 环境变量 | `MYSQL_HOST`、`MYSQL_USER`、`MYSQL_PASSWORD`/`MYSQL_PWD`、`MYSQL_DATABASE`、`MYSQL_TCP_PORT`/`MYSQL_PORT`；`YIKV_MYSQL_*` 同义；CLI 优先 |
 
-**对象存储 / SQL**：`oss://` 等云路径与 **MySQL 线协议** 已在流水线中接入；Hive / ODPS 等可继续以新 **`Source`** 扩展 **生产侧** `RecordBatch`，**写线程与队列语义不变**。
+### 5.3 云对象存储环境变量
 
-**并发扩展（后续能力，非 Phase A）**：多 KV 写线程、`AllocatorMode::Concurrent`、生产侧直接入队 `Doc*` 等需 **引擎原子 `next_doc_id` + HashMap 审计** 与 **唯一主键** 等业务契约；当前分支默认不启用。
+导入前对输入里出现的 scheme 初始化对应 Arrow `FileSystem`（[`cloud_filesystem.h`](src/indexer/source/file/cloud_filesystem.h)）：
+
+| Scheme | 环境变量（摘要） |
+|--------|------------------|
+| `oss://` | `OSS_ENDPOINT`、`OSS_ACCESS_KEY_ID`、`OSS_ACCESS_KEY_SECRET`；可选 `OSS_REGION` |
+| `s3://` | AWS 默认凭证链 |
+| `cos://` | `COS_SECRET_ID`、`COS_SECRET_KEY`；`COS_ENDPOINT` 或 `COS_REGION` |
+| `obs://` | `OBS_ENDPOINT`、`OBS_ACCESS_KEY_ID`、`OBS_SECRET_ACCESS_KEY`；可选 `OBS_REGION` |
+| `gs://` | Google **Application Default Credentials**（如 `GOOGLE_APPLICATION_CREDENTIALS`） |
+
+前缀以 **`/`** 结尾时在导入工具内 **展开**为对象列表（仅 `.parquet`/`.csv`）。
+
+### 5.4 后续扩展
+
+Hive / ODPS 等可实现新 **`Source`**，仍产出 `RecordBatch`，写线程与队列语义不变。多写线程、`AllocatorMode::Concurrent` 等需额外引擎与业务契约，当前默认不启用。
+
+---
+
+## 6. Kafka：`table.json` 与消息格式
+
+表级结构见 [`src/yikv_server/table_config.h`](src/yikv_server/table_config.h)。全局默认 broker：`config.json` → `kafka.default_brokers`。
+
+每条消息：**JSON 对象**（单条）或 **JSON 数组**（批量）。
+
+**单条示例**
+
+```json
+{ "_op": "INSERT", "_ts": 1746784320000, "id": "abc", "score": 42, "tags": ["x","y"] }
+{ "_op": "UPSERT", "_ts": 1746784321000, "id": "abc", "score": 99 }
+{ "_op": "DELETE", "_ts": 1746784322000, "id": "abc" }
+```
+
+**批量示例**
+
+```json
+[
+  { "_op": "INSERT", "_ts": 1746784320000, "id": "1", "name": "Alice" },
+  { "_op": "DELETE", "_ts": 1746784321000, "id": "2" }
+]
+```
+
+| 字段 | 必填 | 说明 |
+|------|------|------|
+| `_op` | ✓ | `INSERT` / `UPSERT` / `DELETE`（大小写不敏感） |
+| `_ts` | ✓ | Unix 毫秒时间戳 |
+| 其它 | — | 与 schema 字段名对应；未知字段可忽略 |
+
+- **INSERT** → `Put`（PK 已存在时行为依赖实现，宜保证幂等）
+- **UPSERT** → `Upsert`
+- **DELETE** → `Delete`（仅需 PK）
+
+offset 持久化等运行细节以源码为准。
+
+---
+
+## 7. 客户端压测：`yikv_server_bench`
+
+对 **Get** 发压，协议 **brpc `baidu_std`**（与线上一致）。
+
+```bash
+bazel run //:yikv_server_bench -- \
+  --server 127.0.0.1:9000 \
+  --index my_table \
+  --keys_file ./pks.txt \
+  --workers 8 \
+  --requests 50000
+```
+
+- **`--server`**：别名 **`--grpc_target`**
+- 键源：**`--keys_file`** 或 **`--local_parquet PATH --pk COLUMN`**
+- 负载：`--requests N` 与 `--duration_sec T` 二选一
+- 输出：一行 JSON（`qps`、延迟分位、`index_get` 等）
+
+---
+
+## 8. 源码与生成物索引
+
+| 路径 | 作用 |
+|------|------|
+| [`proto/yikv_server.fbs`](proto/yikv_server.fbs) | FlatBuffers 业务契约 |
+| [`proto/yikv_db_wire.proto`](proto/yikv_db_wire.proto) | brpc meta 名称文档 |
+| [`proto/yikv_grpc.proto`](proto/yikv_grpc.proto) | gRPC `yikv.db.YikvDb` |
+| [`gen/yikv_server_generated.h`](gen/yikv_server_generated.h) | `flatc --cpp` 生成 |
+| [`src/yikv_server/main.cc`](src/yikv_server/main.cc) | 服务入口 |
+| [`src/yikv_server/rpc/db_brpc_service.cc`](src/yikv_server/rpc/db_brpc_service.cc) | brpc 分发 |
+| [`src/yikv_server/rpc/db_grpc_service.cc`](src/yikv_server/rpc/db_grpc_service.cc) | gRPC 实现 |
+| [`src/yikv_server/db/handlers.cc`](src/yikv_server/db/handlers.cc) | 索引与编解码 |
+| [`src/yikv_server/kafka/kafka_source.cc`](src/yikv_server/kafka/kafka_source.cc) | Kafka 消费 |
+| [`src/bench_main.cc`](src/bench_main.cc) | `yikv_server_bench` |
+| [`src/import_pipeline_main.cc`](src/import_pipeline_main.cc) | `yikv_import_pipeline` |
+
+---
+
+## 9. 与 README 的关系
+
+- **[`README.md`](README.md)**（中文）：项目作用、安装、端到端流程（建索引 → 启服务 → 调用思路）、benchmark 速查。
+- **[`README.en.md`](README.en.md)**（English）：同上结构的英文版。
+- **本文**：RPC 细节、导入流水线、云变量、Kafka 正文、源码地图；修改行为时优先更新此处并与 README / README.en 交叉检查。
