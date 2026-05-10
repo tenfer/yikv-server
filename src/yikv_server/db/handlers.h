@@ -36,13 +36,13 @@ struct HandlerStatus {
 
 // ─── Low-level helpers (used by handlers and KafkaSource) ────────────────────
 
-HandlerStatus ApplyRowToDoc(yikv::index::Doc* doc, const yidiandb::Row* row,
+HandlerStatus ApplyRowToDoc(yikv::index::Doc* doc, const yikv::Row* row,
                             const yikv::schema::Schema* schema);
 
 std::string ExtractPkString(const yikv::index::Doc& doc,
                             const yikv::schema::Schema* schema);
 
-flatbuffers::Offset<yidiandb::Row> BuildRow(flatbuffers::FlatBufferBuilder& fbb,
+flatbuffers::Offset<yikv::Row> BuildRow(flatbuffers::FlatBufferBuilder& fbb,
                                             const yikv::index::Doc&        doc,
                                             const yikv::schema::Schema*    schema);
 

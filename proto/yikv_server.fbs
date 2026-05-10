@@ -1,4 +1,4 @@
-namespace yidiandb;
+namespace yikv;
 
 enum ValueType : ubyte {
   NONE = 0,

@@ -7,7 +7,7 @@ package yikv.db;
 //   Dispatch: BaiduMasterService (SerializedRequest / SerializedResponse)
 //   service_name: "yikv.db.YikvDb"
 //   method names: Get, Put, PutBatch, BatchGet
-//   Body: FlatBuffers root tables in namespace yidiandb (see proto/yikv_server.fbs).
+//   Body: FlatBuffers root tables in namespace yikv (see proto/yikv_server.fbs).
 //
 // This file carries no RPC service definition for protoc-gen; it documents the
 // contract and provides a proto package name matching C++ rpc_constants.

@@ -1,4 +1,4 @@
-// yidiandb_bench — brpc load generator for FlatBuffers Get (yikv.db.YikvDb / Get).
+// yikv_server_bench — brpc load generator for FlatBuffers Get (yikv.db.YikvDb / Get).
 //
 // Phases (wall / cumulative ms in JSON): keys_load, channel_ready, warmup, bench_wall;
 // micro-phases summed across successful RPCs: encode_sum, rpc_sum, decode_sum, index_get_sum;
@@ -61,7 +61,7 @@ struct Flags {
 
 void Usage() {
     std::cerr
-        << "Usage: yidiandb_bench --server HOST:PORT --index TABLE [options]\n"
+        << "Usage: yikv_server_bench --server HOST:PORT --index TABLE [options]\n"
         << "  (FlatBuffers Get via brpc baidu_std + BaiduMasterService; payload SerializedRequest.)\n"
         << "  Required: --index NAME  (must match yikv-server table directory name, e.g. dsp_test3)\n"
         << "  One of:\n"
@@ -277,7 +277,7 @@ static std::string BuildGetRequestPayload(const std::string& pk, const std::stri
     flatbuffers::FlatBufferBuilder fbb(256);
     auto                           pkoff = fbb.CreateString(pk);
     auto                           tnoff = fbb.CreateString(table_name);
-    fbb.Finish(yidiandb::CreateGetRequest(fbb, pkoff, tnoff));
+    fbb.Finish(yikv::CreateGetRequest(fbb, pkoff, tnoff));
     return {reinterpret_cast<const char*>(fbb.GetBufferPointer()), fbb.GetSize()};
 }
 
@@ -363,7 +363,7 @@ void WorkerLoop(const std::string& server, const std::vector<std::string>* keys,
         // Do not run full VerifyBuffer: wide GetResponse rows recurse deeply and can blow stack
         // or dominate CPU; server is trusted to return a valid buffer for Get.
         auto t_d0 = clock::now();
-        const auto* gr = flatbuffers::GetRoot<yidiandb::GetResponse>(fb);
+        const auto* gr = flatbuffers::GetRoot<yikv::GetResponse>(fb);
         if (gr->found())
             st->found.fetch_add(1, std::memory_order_relaxed);
         else

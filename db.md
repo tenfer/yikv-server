@@ -28,8 +28,8 @@
 
 ```bash
 pip install flatbuffers   # 仅当需要 flatc --python 运行时
-flatc --python -o gen_py proto/yikv_server.fbs
-flatc --cpp -o gen proto/yikv_server.fbs
+flatc --python -o tools/yikv_fb_gen proto/yikv_server.fbs   # 生成包 tools/yikv_fb_gen/yikv/
+flatc --cpp -o gen proto/yikv_server.fbs                      # gen/yikv_server_generated.h，namespace yikv
 ```
 
 **构建目标**

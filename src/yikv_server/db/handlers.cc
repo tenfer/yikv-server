@@ -24,35 +24,35 @@ using ::yikv_server::TableSlot;
 
 // ─── Internal helpers ─────────────────────────────────────────────────────────
 
-static std::string FieldTypeMismatch(const FieldDef& def, yidiandb::ValueType vt) {
+static std::string FieldTypeMismatch(const FieldDef& def, yikv::ValueType vt) {
     return "field_id " + std::to_string(def.field_id) + " type mismatch for schema "
            + std::string(yikv::schema::DataTypeName(def.type));
 }
 
-static bool FieldValueMatchesSchema(const FieldDef& def, yidiandb::ValueType vt) {
+static bool FieldValueMatchesSchema(const FieldDef& def, yikv::ValueType vt) {
     if (def.is_array) {
         switch (def.type) {
-            case DataType::Int32:   return vt == yidiandb::ValueType_ARR_I32;
-            case DataType::Int64:   return vt == yidiandb::ValueType_ARR_I64;
-            case DataType::Float32: return vt == yidiandb::ValueType_ARR_F32;
-            case DataType::Float64: return vt == yidiandb::ValueType_ARR_F64;
-            case DataType::String:  return vt == yidiandb::ValueType_ARR_STRING;
+            case DataType::Int32:   return vt == yikv::ValueType_ARR_I32;
+            case DataType::Int64:   return vt == yikv::ValueType_ARR_I64;
+            case DataType::Float32: return vt == yikv::ValueType_ARR_F32;
+            case DataType::Float64: return vt == yikv::ValueType_ARR_F64;
+            case DataType::String:  return vt == yikv::ValueType_ARR_STRING;
             default:                return false;
         }
     }
     switch (def.type) {
-        case DataType::Bool:    return vt == yidiandb::ValueType_BOOL;
-        case DataType::Int32:   return vt == yidiandb::ValueType_I32;
-        case DataType::Int64:   return vt == yidiandb::ValueType_I64;
-        case DataType::Float32: return vt == yidiandb::ValueType_F32;
-        case DataType::Float64: return vt == yidiandb::ValueType_F64;
-        case DataType::String:  return vt == yidiandb::ValueType_STRING;
-        case DataType::Bytes:   return vt == yidiandb::ValueType_BYTES;
+        case DataType::Bool:    return vt == yikv::ValueType_BOOL;
+        case DataType::Int32:   return vt == yikv::ValueType_I32;
+        case DataType::Int64:   return vt == yikv::ValueType_I64;
+        case DataType::Float32: return vt == yikv::ValueType_F32;
+        case DataType::Float64: return vt == yikv::ValueType_F64;
+        case DataType::String:  return vt == yikv::ValueType_STRING;
+        case DataType::Bytes:   return vt == yikv::ValueType_BYTES;
     }
     return false;
 }
 
-HandlerStatus ApplyRowToDoc(Doc* doc, const yidiandb::Row* row, const Schema* schema) {
+HandlerStatus ApplyRowToDoc(Doc* doc, const yikv::Row* row, const Schema* schema) {
     if (!row || !row->fields()) return HandlerStatus::Ok();
     for (auto fv : *row->fields()) {
         if (!fv) continue;
@@ -65,41 +65,41 @@ HandlerStatus ApplyRowToDoc(Doc* doc, const yidiandb::Row* row, const Schema* sc
         }
         const uint32_t fid = def->field_id;
         switch (fv->vtype()) {
-            case yidiandb::ValueType_BOOL:   doc->put_int32(fid, fv->i32() ? 1 : 0); break;
-            case yidiandb::ValueType_I32:    doc->put_int32(fid, fv->i32());          break;
-            case yidiandb::ValueType_I64:    doc->put_int64(fid, fv->i64());          break;
-            case yidiandb::ValueType_F32:    doc->put_float(fid, fv->f32());          break;
-            case yidiandb::ValueType_F64:    doc->put_double(fid, fv->f64());         break;
-            case yidiandb::ValueType_STRING:
+            case yikv::ValueType_BOOL:   doc->put_int32(fid, fv->i32() ? 1 : 0); break;
+            case yikv::ValueType_I32:    doc->put_int32(fid, fv->i32());          break;
+            case yikv::ValueType_I64:    doc->put_int64(fid, fv->i64());          break;
+            case yikv::ValueType_F32:    doc->put_float(fid, fv->f32());          break;
+            case yikv::ValueType_F64:    doc->put_double(fid, fv->f64());         break;
+            case yikv::ValueType_STRING:
                 doc->put_string(fid, fv->s() ? fv->s()->str() : ""); break;
-            case yidiandb::ValueType_BYTES:
+            case yikv::ValueType_BYTES:
                 if (fv->raw())
                     doc->put_string(fid, std::string_view(
                         reinterpret_cast<const char*>(fv->raw()->Data()), fv->raw()->size()));
                 else
                     doc->put_string(fid, "");
                 break;
-            case yidiandb::ValueType_ARR_I32:
+            case yikv::ValueType_ARR_I32:
                 if (fv->ai32())
                     doc->array_put_int32(fid, fv->ai32()->data(),
                                          static_cast<uint32_t>(fv->ai32()->size()));
                 break;
-            case yidiandb::ValueType_ARR_I64:
+            case yikv::ValueType_ARR_I64:
                 if (fv->ai64())
                     doc->array_put_int64(fid, fv->ai64()->data(),
                                          static_cast<uint32_t>(fv->ai64()->size()));
                 break;
-            case yidiandb::ValueType_ARR_F32:
+            case yikv::ValueType_ARR_F32:
                 if (fv->af32())
                     doc->array_put_float(fid, fv->af32()->data(),
                                          static_cast<uint32_t>(fv->af32()->size()));
                 break;
-            case yidiandb::ValueType_ARR_F64:
+            case yikv::ValueType_ARR_F64:
                 if (fv->af64())
                     doc->array_put_double(fid, fv->af64()->data(),
                                           static_cast<uint32_t>(fv->af64()->size()));
                 break;
-            case yidiandb::ValueType_ARR_STRING: {
+            case yikv::ValueType_ARR_STRING: {
                 if (!fv->as()) break;
                 const auto* vec = fv->as();
                 std::vector<std::string_view> parts;
@@ -135,7 +135,7 @@ std::string ExtractPkString(const Doc& doc, const Schema* schema) {
 
 // ─── BuildRow ────────────────────────────────────────────────────────────────
 
-static flatbuffers::Offset<yidiandb::FieldValue> BuildFieldValue(
+static flatbuffers::Offset<yikv::FieldValue> BuildFieldValue(
     flatbuffers::FlatBufferBuilder& fbb, const Doc& doc, const FieldDef& def) {
     const uint32_t fid = def.field_id;
     if (def.is_array) {
@@ -143,26 +143,26 @@ static flatbuffers::Offset<yidiandb::FieldValue> BuildFieldValue(
             case DataType::Int32: {
                 auto v   = doc.array_view_int32(fid);
                 auto vec = v.second ? fbb.CreateVector(v.first, v.second) : 0;
-                return yidiandb::CreateFieldValue(fbb, static_cast<uint16_t>(fid),
-                    yidiandb::ValueType_ARR_I32, 0,0,0,0,0,0, vec,0,0,0,0);
+                return yikv::CreateFieldValue(fbb, static_cast<uint16_t>(fid),
+                    yikv::ValueType_ARR_I32, 0,0,0,0,0,0, vec,0,0,0,0);
             }
             case DataType::Int64: {
                 auto v   = doc.array_view_int64(fid);
                 auto vec = v.second ? fbb.CreateVector(v.first, v.second) : 0;
-                return yidiandb::CreateFieldValue(fbb, static_cast<uint16_t>(fid),
-                    yidiandb::ValueType_ARR_I64, 0,0,0,0,0,0, 0,vec,0,0,0);
+                return yikv::CreateFieldValue(fbb, static_cast<uint16_t>(fid),
+                    yikv::ValueType_ARR_I64, 0,0,0,0,0,0, 0,vec,0,0,0);
             }
             case DataType::Float32: {
                 auto v   = doc.array_view_float(fid);
                 auto vec = v.second ? fbb.CreateVector(v.first, v.second) : 0;
-                return yidiandb::CreateFieldValue(fbb, static_cast<uint16_t>(fid),
-                    yidiandb::ValueType_ARR_F32, 0,0,0,0,0,0, 0,0,vec,0,0);
+                return yikv::CreateFieldValue(fbb, static_cast<uint16_t>(fid),
+                    yikv::ValueType_ARR_F32, 0,0,0,0,0,0, 0,0,vec,0,0);
             }
             case DataType::Float64: {
                 auto v   = doc.array_view_double(fid);
                 auto vec = v.second ? fbb.CreateVector(v.first, v.second) : 0;
-                return yidiandb::CreateFieldValue(fbb, static_cast<uint16_t>(fid),
-                    yidiandb::ValueType_ARR_F64, 0,0,0,0,0,0, 0,0,0,vec,0);
+                return yikv::CreateFieldValue(fbb, static_cast<uint16_t>(fid),
+                    yikv::ValueType_ARR_F64, 0,0,0,0,0,0, 0,0,0,vec,0);
             }
             case DataType::String: {
                 const uint32_t n = doc.array_size(fid);
@@ -173,53 +173,53 @@ static flatbuffers::Offset<yidiandb::FieldValue> BuildFieldValue(
                     strs.push_back(fbb.CreateString(sv.data(), sv.size()));
                 }
                 auto vec = n ? fbb.CreateVector(strs) : 0;
-                return yidiandb::CreateFieldValue(fbb, static_cast<uint16_t>(fid),
-                    yidiandb::ValueType_ARR_STRING, 0,0,0,0,0,0, 0,0,0,0,vec);
+                return yikv::CreateFieldValue(fbb, static_cast<uint16_t>(fid),
+                    yikv::ValueType_ARR_STRING, 0,0,0,0,0,0, 0,0,0,0,vec);
             }
             default:
-                return yidiandb::CreateFieldValue(fbb, static_cast<uint16_t>(fid),
-                    yidiandb::ValueType_NONE, 0,0,0,0,0,0, 0,0,0,0,0);
+                return yikv::CreateFieldValue(fbb, static_cast<uint16_t>(fid),
+                    yikv::ValueType_NONE, 0,0,0,0,0,0, 0,0,0,0,0);
         }
     }
     switch (def.type) {
         case DataType::Bool:
-            return yidiandb::CreateFieldValue(fbb, static_cast<uint16_t>(fid),
-                yidiandb::ValueType_BOOL, doc.get_int32(fid) ? 1 : 0, 0,0,0,0,0, 0,0,0,0,0);
+            return yikv::CreateFieldValue(fbb, static_cast<uint16_t>(fid),
+                yikv::ValueType_BOOL, doc.get_int32(fid) ? 1 : 0, 0,0,0,0,0, 0,0,0,0,0);
         case DataType::Int32:
-            return yidiandb::CreateFieldValue(fbb, static_cast<uint16_t>(fid),
-                yidiandb::ValueType_I32, doc.get_int32(fid), 0,0,0,0,0, 0,0,0,0,0);
+            return yikv::CreateFieldValue(fbb, static_cast<uint16_t>(fid),
+                yikv::ValueType_I32, doc.get_int32(fid), 0,0,0,0,0, 0,0,0,0,0);
         case DataType::Int64:
-            return yidiandb::CreateFieldValue(fbb, static_cast<uint16_t>(fid),
-                yidiandb::ValueType_I64, 0, doc.get_int64(fid), 0,0,0,0, 0,0,0,0,0);
+            return yikv::CreateFieldValue(fbb, static_cast<uint16_t>(fid),
+                yikv::ValueType_I64, 0, doc.get_int64(fid), 0,0,0,0, 0,0,0,0,0);
         case DataType::Float32:
-            return yidiandb::CreateFieldValue(fbb, static_cast<uint16_t>(fid),
-                yidiandb::ValueType_F32, 0,0, doc.get_float(fid), 0,0,0, 0,0,0,0,0);
+            return yikv::CreateFieldValue(fbb, static_cast<uint16_t>(fid),
+                yikv::ValueType_F32, 0,0, doc.get_float(fid), 0,0,0, 0,0,0,0,0);
         case DataType::Float64:
-            return yidiandb::CreateFieldValue(fbb, static_cast<uint16_t>(fid),
-                yidiandb::ValueType_F64, 0,0,0, doc.get_double(fid), 0,0, 0,0,0,0,0);
+            return yikv::CreateFieldValue(fbb, static_cast<uint16_t>(fid),
+                yikv::ValueType_F64, 0,0,0, doc.get_double(fid), 0,0, 0,0,0,0,0);
         case DataType::String: {
             auto sv = doc.get_string(fid);
             auto s  = fbb.CreateString(sv.data(), sv.size());
-            return yidiandb::CreateFieldValue(fbb, static_cast<uint16_t>(fid),
-                yidiandb::ValueType_STRING, 0,0,0,0, s, 0, 0,0,0,0,0);
+            return yikv::CreateFieldValue(fbb, static_cast<uint16_t>(fid),
+                yikv::ValueType_STRING, 0,0,0,0, s, 0, 0,0,0,0,0);
         }
         case DataType::Bytes: {
             auto sv = doc.get_string(fid);
             auto b  = fbb.CreateVector(reinterpret_cast<const uint8_t*>(sv.data()), sv.size());
-            return yidiandb::CreateFieldValue(fbb, static_cast<uint16_t>(fid),
-                yidiandb::ValueType_BYTES, 0,0,0,0, 0, b, 0,0,0,0,0);
+            return yikv::CreateFieldValue(fbb, static_cast<uint16_t>(fid),
+                yikv::ValueType_BYTES, 0,0,0,0, 0, b, 0,0,0,0,0);
         }
     }
-    return yidiandb::CreateFieldValue(fbb, static_cast<uint16_t>(fid),
-        yidiandb::ValueType_NONE, 0,0,0,0,0,0, 0,0,0,0,0);
+    return yikv::CreateFieldValue(fbb, static_cast<uint16_t>(fid),
+        yikv::ValueType_NONE, 0,0,0,0,0,0, 0,0,0,0,0);
 }
 
-flatbuffers::Offset<yidiandb::Row> BuildRow(flatbuffers::FlatBufferBuilder& fbb,
+flatbuffers::Offset<yikv::Row> BuildRow(flatbuffers::FlatBufferBuilder& fbb,
                                             const Doc& doc, const Schema* schema) {
-    std::vector<flatbuffers::Offset<yidiandb::FieldValue>> offs;
+    std::vector<flatbuffers::Offset<yikv::FieldValue>> offs;
     for (const auto& fp : schema->fields())
         offs.push_back(BuildFieldValue(fbb, doc, *fp));
-    return yidiandb::CreateRow(fbb, fbb.CreateVector(offs));
+    return yikv::CreateRow(fbb, fbb.CreateVector(offs));
 }
 
 // ─── Table lookup helper ─────────────────────────────────────────────────────
@@ -246,14 +246,14 @@ static std::optional<TableHandle> AcquireOrError(
 // ─── HandleGet ───────────────────────────────────────────────────────────────
 
 void HandleGet(TableRegistry* reg, const void* req, size_t req_len, std::string* out_resp) {
-    const yidiandb::GetRequest* preq =
-        flatbuffers::GetRoot<yidiandb::GetRequest>(reinterpret_cast<const uint8_t*>(req));
+    const yikv::GetRequest* preq =
+        flatbuffers::GetRoot<yikv::GetRequest>(reinterpret_cast<const uint8_t*>(req));
     flatbuffers::FlatBufferBuilder fbb(1024);
 
     auto error_resp = [](flatbuffers::FlatBufferBuilder& fbb, const std::string& msg,
                          std::string* out) {
         auto er = fbb.CreateString(msg);
-        fbb.Finish(yidiandb::CreateGetResponse(fbb, false, er, 0, 0));
+        fbb.Finish(yikv::CreateGetResponse(fbb, false, er, 0, 0));
         out->assign(reinterpret_cast<const char*>(fbb.GetBufferPointer()), fbb.GetSize());
     };
 
@@ -275,10 +275,10 @@ void HandleGet(TableRegistry* reg, const void* req, size_t req_len, std::string*
     }
     auto er = fbb.CreateString("");
     if (!hit) {
-        fbb.Finish(yidiandb::CreateGetResponse(fbb, false, er, 0, ns));
+        fbb.Finish(yikv::CreateGetResponse(fbb, false, er, 0, ns));
     } else {
         auto row = BuildRow(fbb, out_doc, slot.schema);
-        fbb.Finish(yidiandb::CreateGetResponse(fbb, true, er, row, ns));
+        fbb.Finish(yikv::CreateGetResponse(fbb, true, er, row, ns));
     }
     out_resp->assign(reinterpret_cast<const char*>(fbb.GetBufferPointer()), fbb.GetSize());
 }
@@ -286,14 +286,14 @@ void HandleGet(TableRegistry* reg, const void* req, size_t req_len, std::string*
 // ─── HandlePut ───────────────────────────────────────────────────────────────
 
 void HandlePut(TableRegistry* reg, const void* req, size_t req_len, std::string* out_resp) {
-    const yidiandb::PutRequest* preq =
-        flatbuffers::GetRoot<yidiandb::PutRequest>(reinterpret_cast<const uint8_t*>(req));
+    const yikv::PutRequest* preq =
+        flatbuffers::GetRoot<yikv::PutRequest>(reinterpret_cast<const uint8_t*>(req));
     flatbuffers::FlatBufferBuilder fbb(256);
 
     auto error_resp = [](flatbuffers::FlatBufferBuilder& fbb, const std::string& msg,
                          std::string* out) {
         auto es = fbb.CreateString(msg);
-        fbb.Finish(yidiandb::CreatePutResponse(fbb, false, es));
+        fbb.Finish(yikv::CreatePutResponse(fbb, false, es));
         out->assign(reinterpret_cast<const char*>(fbb.GetBufferPointer()), fbb.GetSize());
     };
 
@@ -316,21 +316,21 @@ void HandlePut(TableRegistry* reg, const void* req, size_t req_len, std::string*
         slot.kv->Upsert(&doc);
     }
     auto es = fbb.CreateString("");
-    fbb.Finish(yidiandb::CreatePutResponse(fbb, true, es));
+    fbb.Finish(yikv::CreatePutResponse(fbb, true, es));
     out_resp->assign(reinterpret_cast<const char*>(fbb.GetBufferPointer()), fbb.GetSize());
 }
 
 // ─── HandlePutBatch ──────────────────────────────────────────────────────────
 
 void HandlePutBatch(TableRegistry* reg, const void* req, size_t req_len, std::string* out_resp) {
-    const yidiandb::PutBatchRequest* preq =
-        flatbuffers::GetRoot<yidiandb::PutBatchRequest>(reinterpret_cast<const uint8_t*>(req));
+    const yikv::PutBatchRequest* preq =
+        flatbuffers::GetRoot<yikv::PutBatchRequest>(reinterpret_cast<const uint8_t*>(req));
     flatbuffers::FlatBufferBuilder fbb(256);
 
     auto error_resp = [](flatbuffers::FlatBufferBuilder& fbb, const std::string& msg,
                          std::string* out) {
         auto es = fbb.CreateString(msg);
-        fbb.Finish(yidiandb::CreatePutBatchResponse(fbb, false, es));
+        fbb.Finish(yikv::CreatePutBatchResponse(fbb, false, es));
         out->assign(reinterpret_cast<const char*>(fbb.GetBufferPointer()), fbb.GetSize());
     };
 
@@ -348,7 +348,7 @@ void HandlePutBatch(TableRegistry* reg, const void* req, size_t req_len, std::st
         std::vector<Doc> staged;
         staged.reserve(rows->size());
         for (flatbuffers::uoffset_t i = 0; i < rows->size(); ++i) {
-            const yidiandb::Row* row = rows->Get(i);
+            const yikv::Row* row = rows->Get(i);
             if (!row) { error_resp(fbb, "null row in batch", out_resp); return; }
             Doc doc = slot.kv->NewDoc();
             HandlerStatus st = ApplyRowToDoc(&doc, row, slot.schema);
@@ -366,21 +366,21 @@ void HandlePutBatch(TableRegistry* reg, const void* req, size_t req_len, std::st
         slot.kv->BatchUpsert(ptrs);
     }
     auto es = fbb.CreateString("");
-    fbb.Finish(yidiandb::CreatePutBatchResponse(fbb, true, es));
+    fbb.Finish(yikv::CreatePutBatchResponse(fbb, true, es));
     out_resp->assign(reinterpret_cast<const char*>(fbb.GetBufferPointer()), fbb.GetSize());
 }
 
 // ─── HandleBatchGet ──────────────────────────────────────────────────────────
 
 void HandleBatchGet(TableRegistry* reg, const void* req, size_t req_len, std::string* out_resp) {
-    const yidiandb::BatchGetRequest* preq =
-        flatbuffers::GetRoot<yidiandb::BatchGetRequest>(reinterpret_cast<const uint8_t*>(req));
+    const yikv::BatchGetRequest* preq =
+        flatbuffers::GetRoot<yikv::BatchGetRequest>(reinterpret_cast<const uint8_t*>(req));
     flatbuffers::FlatBufferBuilder fbb(4096);
 
     auto error_resp = [](flatbuffers::FlatBufferBuilder& fbb, const std::string& msg,
                          std::string* out) {
         auto es = fbb.CreateString(msg);
-        fbb.Finish(yidiandb::CreateBatchGetResponse(fbb, 0, es));
+        fbb.Finish(yikv::CreateBatchGetResponse(fbb, 0, es));
         out->assign(reinterpret_cast<const char*>(fbb.GetBufferPointer()), fbb.GetSize());
     };
 
@@ -390,19 +390,19 @@ void HandleBatchGet(TableRegistry* reg, const void* req, size_t req_len, std::st
     if (!h) return;
     TableSlot& slot = **h;
 
-    std::vector<flatbuffers::Offset<yidiandb::Row>> row_offs;
+    std::vector<flatbuffers::Offset<yikv::Row>> row_offs;
     const auto* pks = preq->pks();
     for (flatbuffers::uoffset_t i = 0; i < pks->size(); ++i) {
         const auto* pk_s = pks->Get(i);
-        if (!pk_s) { row_offs.push_back(yidiandb::CreateRow(fbb, 0)); continue; }
+        if (!pk_s) { row_offs.push_back(yikv::CreateRow(fbb, 0)); continue; }
         Doc out_doc;
         if (!slot.kv->Get(pk_s->str(), &out_doc))
-            row_offs.push_back(yidiandb::CreateRow(fbb, 0));
+            row_offs.push_back(yikv::CreateRow(fbb, 0));
         else
             row_offs.push_back(BuildRow(fbb, out_doc, slot.schema));
     }
     auto es = fbb.CreateString("");
-    fbb.Finish(yidiandb::CreateBatchGetResponse(fbb, fbb.CreateVector(row_offs), es));
+    fbb.Finish(yikv::CreateBatchGetResponse(fbb, fbb.CreateVector(row_offs), es));
     out_resp->assign(reinterpret_cast<const char*>(fbb.GetBufferPointer()), fbb.GetSize());
 }
 

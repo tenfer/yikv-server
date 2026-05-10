@@ -26,23 +26,23 @@ sys.path.insert(0, str(_TOOLS / "yikv_fb_gen"))
 
 import flatbuffers  # noqa: E402
 import grpc  # noqa: E402
-from yidiandb.BatchGetRequest import (  # noqa: E402
+from yikv.BatchGetRequest import (  # noqa: E402
     BatchGetRequestAddPks,
     BatchGetRequestAddTableName,
     BatchGetRequestEnd,
     BatchGetRequestStart,
     BatchGetRequestStartPksVector,
 )
-from yidiandb.BatchGetResponse import BatchGetResponse  # noqa: E402
-from yidiandb.GetRequest import (  # noqa: E402
+from yikv.BatchGetResponse import BatchGetResponse  # noqa: E402
+from yikv.GetRequest import (  # noqa: E402
     GetRequestAddPk,
     GetRequestAddTableName,
     GetRequestEnd,
     GetRequestStart,
 )
-from yidiandb.GetResponse import GetResponse  # noqa: E402
-from yidiandb.Row import Row  # noqa: E402
-from yidiandb.ValueType import ValueType  # noqa: E402
+from yikv.GetResponse import GetResponse  # noqa: E402
+from yikv.Row import Row  # noqa: E402
+from yikv.ValueType import ValueType  # noqa: E402
 
 
 def _fb_get_request(pk: str, table: str) -> bytes:
