@@ -38,6 +38,7 @@ table Row {
 
 table GetRequest {
   pk:string (required);
+  table_name:string;
 }
 
 table GetResponse {
@@ -49,6 +50,7 @@ table GetResponse {
 
 table PutRequest {
   row:Row (required);
+  table_name:string;
 }
 
 table PutResponse {
@@ -58,6 +60,7 @@ table PutResponse {
 
 table BatchGetRequest {
   pks:[string];
+  table_name:string;
 }
 
 table BatchGetResponse {
@@ -67,6 +70,7 @@ table BatchGetResponse {
 
 table PutBatchRequest {
   rows:[Row] (required);
+  table_name:string;
 }
 
 table PutBatchResponse {

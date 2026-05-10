@@ -1,4 +1,0 @@
-# tools/oss_import_parquet.py: pyarrow + oss2; flatbuffers if you extend Python builders.
-flatbuffers>=1.12,<25
-pyarrow>=14.0.0
-oss2>=2.18.0

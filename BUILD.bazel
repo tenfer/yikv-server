@@ -1,11 +1,22 @@
 load("@rules_cc//cc:defs.bzl", "cc_binary", "cc_library")
 load("@rules_proto//proto:defs.bzl", "proto_library")
+load("@com_google_protobuf//bazel:cc_proto_library.bzl", "cc_proto_library")
 
 package(default_visibility = ["//visibility:public"])
 
 proto_library(
     name = "yikv_db_wire_proto",
     srcs = ["proto/yikv_db_wire.proto"],
+)
+
+proto_library(
+    name = "yikv_grpc_proto",
+    srcs = ["proto/yikv_grpc.proto"],
+)
+
+cc_proto_library(
+    name = "yikv_grpc_cc_proto",
+    deps = [":yikv_grpc_proto"],
 )
 
 cc_library(
@@ -24,14 +35,144 @@ cc_library(
 )
 
 cc_library(
+    name = "server_config",
+    hdrs = ["src/yikv_server/server_config.h"],
+    copts = ["-std=c++20"],
+    includes = ["src/yikv_server"],
+    deps = ["@nlohmann_json//:json"],
+)
+
+cc_library(
+    name = "arrow_doc_helpers",
+    srcs = ["src/import/arrow_doc_helpers.cc"],
+    hdrs = ["src/import/arrow_doc_helpers.h"],
+    copts = ["-std=c++20"],
+    includes = ["src"],
+    linkopts = ["-larrow"],
+    deps = [
+        "@yikv//src/index:kv_index",
+        "@yikv//src/schema:schema",
+    ],
+)
+
+cc_library(
+    name = "indexer_queue",
+    srcs = ["src/indexer/queue/parsed_batch_queue.cc"],
+    hdrs = ["src/indexer/queue/parsed_batch_queue.h"],
+    copts = ["-std=c++20"],
+    includes = ["src"],
+    linkopts = ["-larrow"],
+)
+
+cc_library(
+    name = "indexer_source",
+    srcs = [
+        "src/indexer/source/file/file_source.cc",
+        "src/indexer/source/file/cloud_filesystem.cc",
+        "src/indexer/source/sql/mysql_wire_source.cc",
+        "src/indexer/source/sql/odps_source.cc",
+        "src/indexer/source/sql/hive_source.cc",
+    ],
+    hdrs = [
+        "src/indexer/source/source.h",
+        "src/indexer/source/file/file_source.h",
+        "src/indexer/source/file/cloud_filesystem.h",
+        "src/indexer/source/sql/mysql_wire_source.h",
+        "src/indexer/source/sql/odps_source.h",
+        "src/indexer/source/sql/hive_source.h",
+    ],
+    copts = [
+        "-std=c++20",
+        "-I/usr/include/mysql",
+        "-I/usr/include/mariadb",
+    ],
+    includes = ["src"],
+    linkopts = [
+        "-larrow",
+        "-lparquet",
+        "-lmysqlclient",
+    ],
+    deps = [
+        ":indexer_queue",
+        "@yikv//src/schema:schema",
+    ],
+)
+
+cc_library(
+    name = "indexer_publisher",
+    srcs = ["src/indexer/publisher/io_publisher.cc"],
+    hdrs = ["src/indexer/publisher/io_publisher.h"],
+    copts = ["-std=c++20"],
+    includes = ["src"],
+    deps = [
+        ":indexer_queue",
+        ":indexer_source",
+    ],
+)
+
+cc_library(
+    name = "indexer_worker",
+    srcs = ["src/indexer/worker/kv_write_worker.cc"],
+    hdrs = ["src/indexer/worker/kv_write_worker.h"],
+    copts = ["-std=c++20"],
+    includes = ["src"],
+    linkopts = ["-larrow"],
+    deps = [
+        ":arrow_doc_helpers",
+        ":indexer_queue",
+        "@yikv//src/index:kv_index",
+        "@yikv//src/schema:schema",
+    ],
+)
+
+cc_library(
+    name = "table_config",
+    hdrs = ["src/yikv_server/table_config.h"],
+    copts = ["-std=c++20"],
+    includes = ["src/yikv_server"],
+    deps = ["@nlohmann_json//:json"],
+)
+
+cc_library(
+    name = "kafka_source_lib",
+    srcs = ["src/yikv_server/kafka/kafka_source.cc"],
+    hdrs = ["src/yikv_server/kafka/kafka_source.h"],
+    copts = ["-std=c++20"],
+    includes = ["src/yikv_server"],
+    deps = [
+        "@librdkafka//:rdkafka",
+        "@nlohmann_json//:json",
+        "@yikv//src/index:kv_index",
+        "@yikv//src/schema:schema",
+    ],
+)
+
+cc_library(
+    name = "table_registry_lib",
+    srcs = ["src/yikv_server/table_registry.cc"],
+    hdrs = ["src/yikv_server/table_registry.h"],
+    copts = ["-std=c++20"],
+    includes = ["src/yikv_server"],
+    deps = [
+        ":kafka_source_lib",
+        ":table_config",
+        "@yikv//src/db:db",
+        "@yikv//src/index:kv_index",
+        "@yikv//src/schema:schema",
+    ],
+)
+
+cc_library(
     name = "yikv_server_lib",
     srcs = [
         "src/yikv_server/db/handlers.cc",
         "src/yikv_server/rpc/db_brpc_service.cc",
+        "src/yikv_server/rpc/db_grpc_service.cc",
     ],
     hdrs = [
         "src/yikv_server/db/handlers.h",
         "src/yikv_server/rpc/db_brpc_service.h",
+        "src/yikv_server/rpc/db_grpc_service.h",
     ],
     copts = ["-std=c++20"],
     includes = [
@@ -42,7 +183,10 @@ cc_library(
     deps = [
         ":db_fbs",
         ":rpc_constants",
+        ":table_registry_lib",
+        ":yikv_grpc_cc_proto",
         "@com_github_apache_brpc//:brpc",
+        "@com_google_protobuf//:protobuf",
         "@yikv//src/db:db",
         "@yikv//src/index:kv_index",
         "@yikv//src/schema:schema",
@@ -55,10 +199,11 @@ cc_binary(
     copts = ["-std=c++20"],
     includes = ["src/yikv_server"],
     deps = [
+        ":server_config",
+        ":table_registry_lib",
         ":yikv_server_lib",
         "@com_github_apache_brpc//:brpc",
         "@yikv//src/db:db",
-        "@yikv//src/index:kv_index",
     ],
 )
 
@@ -84,11 +229,16 @@ cc_binary(
 )
 
 cc_binary(
-    name = "yikv_import_parquet",
-    srcs = ["src/import_parquet_main.cc"],
+    name = "yikv_import_pipeline",
+    srcs = ["src/import_pipeline_main.cc"],
     copts = ["-std=c++20"],
+    includes = ["src/yikv_server", "src"],
     linkopts = ["-lparquet", "-larrow", "-pthread"],
     deps = [
+        ":indexer_publisher",
+        ":indexer_source",
+        ":indexer_worker",
+        ":server_config",
         "@yikv//src/db:db",
         "@yikv//src/index:kv_index",
         "@yikv//src/schema:schema",

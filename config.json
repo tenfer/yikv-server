@@ -1,0 +1,9 @@
+{
+  "db_path": "/data/yikv_data",
+  "listen": "0.0.0.0:9000",
+  "arena_seg_gb": 1,
+  "arena_max_gb": 100,
+  "kafka": {
+    "default_brokers": "broker1:9092,broker2:9092"
+  }
+}

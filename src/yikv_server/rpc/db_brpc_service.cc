@@ -2,17 +2,17 @@
 
 #include "db/handlers.h"
 #include "rpc/rpc_constants.h"
+#include "table_registry.h"
 
 #include <brpc/closure_guard.h>
 #include <brpc/controller.h>
 
-#include "src/schema/schema.h"
-
 namespace yikv_server::rpc {
 
-DbBrpcService::DbBrpcService(yikv::index::KVIndex* idx) : idx_(idx), schema_(idx->schema()) {}
+DbBrpcService::DbBrpcService(TableRegistry* reg) : reg_(reg) {}
 
-void DbBrpcService::ProcessRpcRequest(brpc::Controller* cntl, const brpc::SerializedRequest* request,
+void DbBrpcService::ProcessRpcRequest(brpc::Controller* cntl,
+                                      const brpc::SerializedRequest* request,
                                       brpc::SerializedResponse* response,
                                       ::google::protobuf::Closure* done) {
     brpc::ClosureGuard done_guard(done);
@@ -35,13 +35,13 @@ void DbBrpcService::ProcessRpcRequest(brpc::Controller* cntl, const brpc::Serial
     const size_t req_len = req_bytes.size();
 
     if (meta.method_name() == kMethodGet) {
-        yikv_server::db::HandleGet(idx_, schema_, req_ptr, req_len, &resp);
+        yikv_server::db::HandleGet(reg_, req_ptr, req_len, &resp);
     } else if (meta.method_name() == kMethodPut) {
-        yikv_server::db::HandlePut(idx_, schema_, &write_mu_, req_ptr, req_len, &resp);
+        yikv_server::db::HandlePut(reg_, req_ptr, req_len, &resp);
     } else if (meta.method_name() == kMethodPutBatch) {
-        yikv_server::db::HandlePutBatch(idx_, schema_, &write_mu_, req_ptr, req_len, &resp);
+        yikv_server::db::HandlePutBatch(reg_, req_ptr, req_len, &resp);
     } else if (meta.method_name() == kMethodBatchGet) {
-        yikv_server::db::HandleBatchGet(idx_, schema_, req_ptr, req_len, &resp);
+        yikv_server::db::HandleBatchGet(reg_, req_ptr, req_len, &resp);
     } else {
         cntl->SetFailed(brpc::ENOMETHOD, "unknown method=%s", meta.method_name().c_str());
         return;

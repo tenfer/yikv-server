@@ -57,6 +57,35 @@ cc_library(name = "crypto", linkopts = ["-lcrypto"])
 """,
 )
 
+new_local_repository(
+    name = "librdkafka",
+    path = "third_party/librdkafka_stub",
+    build_file_content = """\
+load("@rules_cc//cc:defs.bzl", "cc_library")
+package(default_visibility = ["//visibility:public"])
+cc_library(
+    name = "rdkafka",
+    hdrs = glob(["include/librdkafka/*.h"]),
+    includes = ["include"],
+    linkopts = ["-lrdkafka"],
+)
+""",
+)
+
+new_local_repository(
+    name = "nlohmann_json",
+    path = "third_party/nlohmann_json_stub",
+    build_file_content = """\
+load("@rules_cc//cc:defs.bzl", "cc_library")
+package(default_visibility = ["//visibility:public"])
+cc_library(
+    name = "json",
+    hdrs = glob(["include/nlohmann/*.hpp"]),
+    includes = ["include"],
+)
+""",
+)
+
 http_archive(
     name = "com_github_apache_brpc",
     sha256 = "60f218554527f05ad8fae3cb8f81879d0c7dc72b249cde132049c44b1a73e76d",

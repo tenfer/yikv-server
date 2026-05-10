@@ -1,30 +1,26 @@
 #pragma once
 
 #include <brpc/baidu_master_service.h>
-#include <mutex>
 
-#include "src/index/kv_index.h"
-
-namespace yikv::schema {
-class Schema;
+namespace yikv_server {
+class TableRegistry;
 }
 
 namespace yikv_server::rpc {
 
 // brpc adapter: BaiduMasterService + SerializedRequest/Response bodies = FlatBuffers.
+// Routes to the correct KVIndex via TableRegistry using table_name in the request.
 class DbBrpcService final : public brpc::BaiduMasterService {
 public:
-    explicit DbBrpcService(yikv::index::KVIndex* idx);
+    explicit DbBrpcService(TableRegistry* reg);
 
-    void ProcessRpcRequest(brpc::Controller* cntl,
+    void ProcessRpcRequest(brpc::Controller*              cntl,
                            const brpc::SerializedRequest* request,
-                           brpc::SerializedResponse* response,
-                           ::google::protobuf::Closure* done) override;
+                           brpc::SerializedResponse*      response,
+                           ::google::protobuf::Closure*   done) override;
 
 private:
-    yikv::index::KVIndex*         idx_;
-    const yikv::schema::Schema*   schema_;
-    std::mutex                    write_mu_;
+    TableRegistry* reg_;
 };
 
 }  // namespace yikv_server::rpc

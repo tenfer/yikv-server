@@ -10,6 +10,7 @@
 
 #include <arrow/api.h>
 #include <arrow/io/api.h>
+#include <arrow/scalar.h>
 #include <parquet/arrow/reader.h>
 
 #include <brpc/channel.h>
@@ -30,6 +31,7 @@
 #include <iostream>
 #include <memory>
 #include <sstream>
+#include <utility>
 #include <string>
 #include <thread>
 #include <vector>
@@ -43,7 +45,9 @@ double Ms(std::chrono::nanoseconds ns) {
 }
 
 struct Flags {
-    std::string  server              = "127.0.0.1:8000";
+    std::string  server              = "127.0.0.1:9000";
+    // KV table name (FlatBuffers GetRequest.table_name); must match server registry.
+    std::string  index;
     int          workers           = 8;
     int          warmup            = 32;
     double       duration_sec      = 0;
@@ -57,8 +61,9 @@ struct Flags {
 
 void Usage() {
     std::cerr
-        << "Usage: yidiandb_bench --server HOST:PORT [options]\n"
+        << "Usage: yidiandb_bench --server HOST:PORT --index TABLE [options]\n"
         << "  (FlatBuffers Get via brpc baidu_std + BaiduMasterService; payload SerializedRequest.)\n"
+        << "  Required: --index NAME  (must match yikv-server table directory name, e.g. dsp_test3)\n"
         << "  One of:\n"
         << "    --keys_file PATH          (one pk per line; empty lines skipped)\n"
         << "    --local_parquet PATH --pk NAME   (optional --max_keys N, default 200000)\n"
@@ -73,6 +78,9 @@ bool ParseFlags(int argc, char** argv, Flags* f) {
         if ((std::strcmp(argv[i], "--server") == 0 || std::strcmp(argv[i], "--grpc_target") == 0) &&
             i + 1 < argc) {
             f->server = argv[++i];
+        } else if ((std::strcmp(argv[i], "--index") == 0 || std::strcmp(argv[i], "--table") == 0) &&
+                   i + 1 < argc) {
+            f->index = argv[++i];
         } else if (std::strcmp(argv[i], "--workers") == 0 && i + 1 < argc) {
             f->workers = std::max(1, std::atoi(argv[++i]));
         } else if (std::strcmp(argv[i], "--warmup") == 0 && i + 1 < argc) {
@@ -96,6 +104,10 @@ bool ParseFlags(int argc, char** argv, Flags* f) {
             return false;
         }
     }
+    if (f->index.empty()) {
+        std::cerr << "--index TABLE is required (e.g. --index dsp_test3)\n";
+        return false;
+    }
     if (f->keys_file.empty() == f->local_parquet.empty()) {
         std::cerr << "Exactly one of --keys_file or --local_parquet is required.\n";
         return false;
@@ -114,30 +126,62 @@ bool ParseFlags(int argc, char** argv, Flags* f) {
 
 bool ArrowCellIsNull(const arrow::Array& col, int64_t row) { return col.IsNull(row); }
 
+// Decode one cell to a pk string via GetScalar so dictionary-encoded Parquet columns work and we
+// avoid invalid static_casts on the physical array type.
 arrow::Status AppendPkString(const arrow::Array& col, int64_t row, std::string* out) {
     if (ArrowCellIsNull(col, row)) return arrow::Status::OK();
-    switch (col.type_id()) {
-        case arrow::Type::STRING: {
-            auto v = static_cast<const arrow::StringArray&>(col).GetView(row);
-            out->assign(v.data(), v.size());
-            return arrow::Status::OK();
-        }
-        case arrow::Type::BINARY: {
-            auto v = static_cast<const arrow::BinaryArray&>(col).GetView(row);
-            out->assign(v.data(), static_cast<size_t>(v.size()));
-            return arrow::Status::OK();
-        }
-        case arrow::Type::INT32:
-            *out = std::to_string(static_cast<const arrow::Int32Array&>(col).Value(row));
-            return arrow::Status::OK();
-        case arrow::Type::INT64:
-            *out = std::to_string(static_cast<const arrow::Int64Array&>(col).Value(row));
+    arrow::Result<std::shared_ptr<arrow::Scalar>> sc_res = col.GetScalar(row);
+    if (!sc_res.ok()) return sc_res.status();
+    const arrow::Scalar& sc = **sc_res;
+    if (!sc.is_valid) return arrow::Status::OK();
+
+    switch (sc.type->id()) {
+        case arrow::Type::NA:
             return arrow::Status::OK();
         case arrow::Type::BOOL:
-            *out = static_cast<const arrow::BooleanArray&>(col).Value(row) ? "1" : "0";
+            *out = static_cast<const arrow::BooleanScalar&>(sc).value ? "1" : "0";
             return arrow::Status::OK();
+        case arrow::Type::INT8:
+            *out = std::to_string(static_cast<int>(static_cast<const arrow::Int8Scalar&>(sc).value));
+            return arrow::Status::OK();
+        case arrow::Type::INT16:
+            *out = std::to_string(static_cast<const arrow::Int16Scalar&>(sc).value);
+            return arrow::Status::OK();
+        case arrow::Type::INT32:
+            *out = std::to_string(static_cast<const arrow::Int32Scalar&>(sc).value);
+            return arrow::Status::OK();
+        case arrow::Type::INT64:
+            *out = std::to_string(static_cast<const arrow::Int64Scalar&>(sc).value);
+            return arrow::Status::OK();
+        case arrow::Type::UINT8:
+            *out = std::to_string(static_cast<const arrow::UInt8Scalar&>(sc).value);
+            return arrow::Status::OK();
+        case arrow::Type::UINT16:
+            *out = std::to_string(static_cast<const arrow::UInt16Scalar&>(sc).value);
+            return arrow::Status::OK();
+        case arrow::Type::UINT32:
+            *out = std::to_string(static_cast<const arrow::UInt32Scalar&>(sc).value);
+            return arrow::Status::OK();
+        case arrow::Type::UINT64:
+            *out = std::to_string(static_cast<const arrow::UInt64Scalar&>(sc).value);
+            return arrow::Status::OK();
+        case arrow::Type::FLOAT:
+            *out = std::to_string(static_cast<const arrow::FloatScalar&>(sc).value);
+            return arrow::Status::OK();
+        case arrow::Type::DOUBLE:
+            *out = std::to_string(static_cast<const arrow::DoubleScalar&>(sc).value);
+            return arrow::Status::OK();
+        case arrow::Type::STRING:
+        case arrow::Type::LARGE_STRING:
+        case arrow::Type::BINARY:
+        case arrow::Type::LARGE_BINARY: {
+            const auto& bs = static_cast<const arrow::BaseBinaryScalar&>(sc);
+            if (!bs.value) return arrow::Status::OK();
+            out->assign(reinterpret_cast<const char*>(bs.value->data()), bs.value->size());
+            return arrow::Status::OK();
+        }
         default:
-            return arrow::Status::Invalid("unsupported pk arrow type");
+            return arrow::Status::Invalid("unsupported pk arrow type: ", sc.type->ToString());
     }
 }
 
@@ -147,7 +191,9 @@ arrow::Status LoadKeysParquet(const std::string& path, const std::string& pk, ui
     ARROW_ASSIGN_OR_RAISE(auto reader, parquet::arrow::OpenFile(infile, arrow::default_memory_pool()));
     ARROW_ASSIGN_OR_RAISE(auto rb_reader, reader->GetRecordBatchReader());
     while (keys->size() < max_keys) {
-        ARROW_ASSIGN_OR_RAISE(auto batch, rb_reader->Next());
+        arrow::Result<std::shared_ptr<arrow::RecordBatch>> batch_res = rb_reader->Next();
+        if (!batch_res.ok()) return batch_res.status();
+        std::shared_ptr<arrow::RecordBatch> batch = *std::move(batch_res);
         if (!batch) break;
         auto col = batch->GetColumnByName(pk);
         if (!col) return arrow::Status::Invalid("no column: ", pk);
@@ -208,6 +254,10 @@ struct WorkerLatencySamples {
 
 static void OneGetRpc(brpc::Channel* channel, const std::string& req_bytes, std::string* resp_out,
                       brpc::Controller* cntl) {
+    // IOBuf::copy_to(string) returns 0 without touching *s when the body is empty; always clear
+    // first so we never decode a stale FlatBuffer from a previous RPC.
+    resp_out->clear();
+
     auto* sampled = new brpc::SampledRequest();
     sampled->meta.set_service_name(yikv_server::rpc::kServiceFullName);
     sampled->meta.set_method_name(yikv_server::rpc::kMethodGet);
@@ -223,12 +273,46 @@ static void OneGetRpc(brpc::Channel* channel, const std::string& req_bytes, std:
     }
 }
 
-void WorkerLoop(brpc::Channel* channel, const std::vector<std::string>* keys, int wid,
-                int num_workers, BenchStats* st, WorkerLatencySamples* lat, uint64_t max_lat_samples,
-                std::atomic<bool>* stop, uint64_t request_cap, bool use_duration,
-                clock::time_point bench_deadline) {
-    size_t     idx = static_cast<size_t>(wid);
-    const size_t kn = keys->size();
+static std::string BuildGetRequestPayload(const std::string& pk, const std::string& table_name) {
+    flatbuffers::FlatBufferBuilder fbb(256);
+    auto                           pkoff = fbb.CreateString(pk);
+    auto                           tnoff = fbb.CreateString(table_name);
+    fbb.Finish(yidiandb::CreateGetRequest(fbb, pkoff, tnoff));
+    return {reinterpret_cast<const char*>(fbb.GetBufferPointer()), fbb.GetSize()};
+}
+
+// FlatBuffers reads scalars at the buffer base; std::string::data() is not guaranteed
+// alignof(uoffset_t)-aligned (SSO / allocator quirks), which faults on strict-alignment CPUs.
+// Copy into a vector and use the first suitably aligned sub-span — no platform-specific free().
+static const uint8_t* AlignFlatbufferInVector(const std::string& resp_str,
+                                              std::vector<uint8_t>* storage) {
+    storage->clear();
+    const size_t n = resp_str.size();
+    if (n < sizeof(flatbuffers::uoffset_t)) return nullptr;
+    constexpr size_t kAlign = alignof(flatbuffers::uoffset_t);
+    storage->resize(n + kAlign);
+    uint8_t* const    base = storage->data();
+    const uintptr_t   addr = reinterpret_cast<uintptr_t>(base);
+    const size_t      skip = (kAlign - (addr % kAlign)) % kAlign;
+    uint8_t* const    dst  = base + skip;
+    std::memcpy(dst, resp_str.data(), n);
+    return dst;
+}
+void WorkerLoop(const std::string& server, const std::vector<std::string>* keys,
+                const std::string& table_name, int wid, int num_workers, BenchStats* st,
+                WorkerLatencySamples* lat, uint64_t max_lat_samples, std::atomic<bool>* stop,
+                uint64_t request_cap, bool use_duration, clock::time_point bench_deadline) {
+    brpc::Channel        channel;
+    brpc::ChannelOptions chopt;
+    chopt.protocol = "baidu_std";
+    if (channel.Init(server.c_str(), &chopt) != 0) {
+        std::cerr << "worker " << wid << ": brpc::Channel::Init failed for " << server << "\n";
+        stop->store(true, std::memory_order_release);
+        return;
+    }
+
+    size_t       idx = static_cast<size_t>(wid);
+    const size_t kn  = keys->size();
 
     while (!stop->load(std::memory_order_acquire)) {
         if (!use_duration) {
@@ -245,11 +329,7 @@ void WorkerLoop(brpc::Channel* channel, const std::vector<std::string>* keys, in
         std::string req_bytes;
         {
             auto t0 = clock::now();
-            flatbuffers::FlatBufferBuilder fbb(256);
-            auto                           pkoff = fbb.CreateString(pk);
-            auto                           off = yidiandb::CreateGetRequest(fbb, pkoff);
-            fbb.Finish(off);
-            req_bytes.assign(reinterpret_cast<const char*>(fbb.GetBufferPointer()), fbb.GetSize());
+            req_bytes = BuildGetRequestPayload(pk, table_name);
             auto t1 = clock::now();
             enc_ns = static_cast<uint64_t>(
                 std::chrono::duration_cast<std::chrono::nanoseconds>(t1 - t0).count());
@@ -259,7 +339,7 @@ void WorkerLoop(brpc::Channel* channel, const std::vector<std::string>* keys, in
         brpc::Controller cntl;
         auto             t_rpc0 = clock::now();
         std::string       resp_str;
-        OneGetRpc(channel, req_bytes, &resp_str, &cntl);
+        OneGetRpc(&channel, req_bytes, &resp_str, &cntl);
         auto t_rpc1 = clock::now();
         uint64_t rpc1_ns = static_cast<uint64_t>(
             std::chrono::duration_cast<std::chrono::nanoseconds>(t_rpc1 - t_rpc0).count());
@@ -270,8 +350,20 @@ void WorkerLoop(brpc::Channel* channel, const std::vector<std::string>* keys, in
             continue;
         }
 
+        if (resp_str.size() < sizeof(flatbuffers::uoffset_t)) {
+            st->rpc_err.fetch_add(1, std::memory_order_relaxed);
+            continue;
+        }
+        std::vector<uint8_t> fb_storage;
+        const uint8_t* fb = AlignFlatbufferInVector(resp_str, &fb_storage);
+        if (!fb) {
+            st->rpc_err.fetch_add(1, std::memory_order_relaxed);
+            continue;
+        }
+        // Do not run full VerifyBuffer: wide GetResponse rows recurse deeply and can blow stack
+        // or dominate CPU; server is trusted to return a valid buffer for Get.
         auto t_d0 = clock::now();
-        const auto* gr = flatbuffers::GetRoot<yidiandb::GetResponse>(resp_str.data());
+        const auto* gr = flatbuffers::GetRoot<yidiandb::GetResponse>(fb);
         if (gr->found())
             st->found.fetch_add(1, std::memory_order_relaxed);
         else
@@ -300,6 +392,24 @@ void WorkerLoop(brpc::Channel* channel, const std::vector<std::string>* keys, in
     }
 }
 
+void PrintStartupParams(const Flags& fl) {
+    std::cerr << "yikv_server_bench startup params:\n"
+              << "  server=" << fl.server << "\n"
+              << "  index=" << fl.index << "\n"
+              << "  workers=" << fl.workers << "\n"
+              << "  warmup=" << fl.warmup << "\n";
+    if (fl.duration_sec > 0)
+        std::cerr << "  duration_sec=" << fl.duration_sec << "\n";
+    else
+        std::cerr << "  requests=" << fl.requests << "\n";
+    std::cerr << "  max_keys=" << fl.max_keys << "\n"
+              << "  max_latency_samples=" << fl.max_latency_samples << "\n";
+    if (!fl.keys_file.empty())
+        std::cerr << "  keys_file=" << fl.keys_file << "\n";
+    if (!fl.local_parquet.empty())
+        std::cerr << "  local_parquet=" << fl.local_parquet << "\n  pk=" << fl.pk_column << "\n";
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -308,6 +418,7 @@ int main(int argc, char** argv) {
         Usage();
         return 2;
     }
+    PrintStartupParams(fl);
 
     std::vector<std::string> keys;
     auto                     t_keys0 = clock::now();
@@ -340,12 +451,9 @@ int main(int argc, char** argv) {
     auto t_w0 = clock::now();
     for (int w = 0; w < fl.warmup; ++w) {
         const std::string& pk = keys[static_cast<size_t>(w) % keys.size()];
-        flatbuffers::FlatBufferBuilder fbb(256);
-        auto                           pkoff = fbb.CreateString(pk);
-        fbb.Finish(yidiandb::CreateGetRequest(fbb, pkoff));
-        std::string req_bytes(reinterpret_cast<const char*>(fbb.GetBufferPointer()), fbb.GetSize());
-        brpc::Controller cntl;
-        std::string      resp;
+        std::string        req_bytes = BuildGetRequestPayload(pk, fl.index);
+        brpc::Controller  cntl;
+        std::string       resp;
         OneGetRpc(&channel, req_bytes, &resp, &cntl);
     }
     auto warmup_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(clock::now() - t_w0);
@@ -363,9 +471,11 @@ int main(int argc, char** argv) {
     std::vector<std::thread> threads;
     threads.reserve(static_cast<size_t>(fl.workers));
     for (int w = 0; w < fl.workers; ++w) {
-        threads.emplace_back(WorkerLoop, &channel, &keys, w, fl.workers, &stats,
-                             &wlat[static_cast<size_t>(w)], fl.max_latency_samples, &stop, cap,
-                             duration_mode, bench_deadline);
+        threads.emplace_back([&, w] {
+            WorkerLoop(fl.server, &keys, fl.index, w, fl.workers, &stats,
+                       &wlat[static_cast<size_t>(w)], fl.max_latency_samples, &stop, cap,
+                       duration_mode, bench_deadline);
+        });
     }
 
     if (duration_mode) {
@@ -416,6 +526,7 @@ int main(int argc, char** argv) {
     json << std::fixed << std::setprecision(3);
     json << "{\n"
          << "  \"server\": \"" << fl.server << "\",\n"
+         << "  \"index\": \"" << fl.index << "\",\n"
          << "  \"protocol\": \"baidu_std\",\n"
          << "  \"service\": \"" << yikv_server::rpc::kServiceFullName << "\",\n"
          << "  \"method\": \"" << yikv_server::rpc::kMethodGet << "\",\n"

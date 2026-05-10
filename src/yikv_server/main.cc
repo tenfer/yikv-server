@@ -1,159 +1,84 @@
-// yikv-server — brpc (SerializedRequest payload = FlatBuffers) over yikv KV index.
+// yikv-server: multi-table KV index server.
+//
+// All per-server parameters come from a single config.json:
+//   yikv_server config.json
+//
+// Per-table config (kafka topic, etc.) lives in {db_path}/{table_name}/table.json
+// and is loaded automatically on startup. New tables dropped into db_path are
+// detected by inotify and hot-loaded without restarting the server.
 
 #include "rpc/db_brpc_service.h"
+#include "rpc/db_grpc_service.h"
+#include "server_config.h"
+#include "table_registry.h"
 
 #include <brpc/server.h>
 
 #include "src/db/db.h"
-#include "src/schema/schema.h"
-#include <cstdlib>
-#include <cstring>
+
 #include <filesystem>
-#include <fstream>
 #include <iostream>
-#include <iterator>
 #include <memory>
 #include <stdexcept>
 #include <string>
 
-namespace {
-
-using yikv::alloc::AllocatorMode;
-using yikv::db::DB;
-using yikv::db::DBOptions;
-
-struct Flags {
-    std::string   db_path;
-    std::string   index_name;
-    std::string   listen = "0.0.0.0:9000";
-    int           port = -1;  // if >= 0, replaces port in --listen (or appends to host-only)
-    std::string   schema_json_path;
-    bool          create_if_missing = false;
-    bool          recreate          = false;
-    std::uint64_t arena_seg_gb      = 1;
-    std::uint64_t arena_max_gb      = 512;
-};
-
-bool ParseFlags(int argc, char** argv, Flags* f) {
-    for (int i = 1; i < argc; ++i) {
-        if (std::strcmp(argv[i], "--db") == 0 && i + 1 < argc) {
-            f->db_path = argv[++i];
-        } else if (std::strcmp(argv[i], "--index") == 0 && i + 1 < argc) {
-            f->index_name = argv[++i];
-        } else if (std::strcmp(argv[i], "--listen") == 0 && i + 1 < argc) {
-            f->listen = argv[++i];
-        } else if (std::strcmp(argv[i], "--port") == 0 && i + 1 < argc) {
-            char*            end = nullptr;
-            unsigned long    v   = std::strtoul(argv[++i], &end, 10);
-            if (end == argv[i] || *end != '\0' || v == 0 || v > 65535) {
-                std::cerr << "--port must be 1-65535\n";
-                return false;
-            }
-            f->port = static_cast<int>(v);
-        } else if (std::strcmp(argv[i], "--schema_json") == 0 && i + 1 < argc) {
-            f->schema_json_path = argv[++i];
-        } else if (std::strcmp(argv[i], "--create_if_missing") == 0) {
-            f->create_if_missing = true;
-        } else if (std::strcmp(argv[i], "--recreate") == 0) {
-            f->recreate = true;
-        } else if (std::strcmp(argv[i], "--arena_seg_gb") == 0 && i + 1 < argc) {
-            f->arena_seg_gb = std::strtoull(argv[++i], nullptr, 10);
-        } else if (std::strcmp(argv[i], "--arena_max_gb") == 0 && i + 1 < argc) {
-            f->arena_max_gb = std::strtoull(argv[++i], nullptr, 10);
-        } else {
-            std::cerr << "Unknown arg: " << argv[i] << "\n";
-            return false;
-        }
-    }
-    if (f->db_path.empty() || f->index_name.empty()) {
-        std::cerr << "Required: --db PATH --index NAME\n";
-        return false;
-    }
-    if (f->create_if_missing && f->schema_json_path.empty()) {
-        std::cerr << "--create_if_missing requires --schema_json FILE\n";
-        return false;
-    }
-    if (f->arena_seg_gb == 0 || f->arena_max_gb == 0) {
-        std::cerr << "--arena_seg_gb and --arena_max_gb must be positive\n";
-        return false;
-    }
-    if (f->arena_max_gb < f->arena_seg_gb) {
-        std::cerr << "--arena_max_gb must be >= --arena_seg_gb\n";
-        return false;
-    }
-    if (f->port >= 0) {
-        const auto colon = f->listen.rfind(':');
-        if (colon != std::string::npos) {
-            f->listen = f->listen.substr(0, colon + 1) + std::to_string(f->port);
-        } else {
-            f->listen += ':';
-            f->listen += std::to_string(f->port);
-        }
-    }
-    return true;
-}
-
-std::string ReadFile(const std::string& path) {
-    std::ifstream in(path, std::ios::in | std::ios::binary);
-    if (!in) throw std::runtime_error("cannot read file: " + path);
-    std::string data((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
-    return data;
-}
-
-}  // namespace
-
 int main(int argc, char** argv) {
-    Flags fl;
-    if (!ParseFlags(argc, argv, &fl)) return 2;
+    if (argc < 2) {
+        std::cerr << "Usage: yikv_server config.json\n";
+        return 2;
+    }
 
+    yikv_server::ServerConfig cfg;
+    try {
+        cfg = yikv_server::LoadServerConfig(argv[1]);
+    } catch (const std::exception& e) {
+        std::cerr << "config error: " << e.what() << "\n";
+        return 2;
+    }
+
+    // ── Init DB ──────────────────────────────────────────────────────────────
     yikv::db::DBOptions opt;
-    opt.db_path                       = fl.db_path;
-    opt.alloc_defaults.mode           = AllocatorMode::Concurrent;
-    const std::uint64_t seg_b         = fl.arena_seg_gb * 1024ull * 1024ull * 1024ull;
+    opt.db_path                       = cfg.db_path;
+    opt.alloc_defaults.mode           = yikv::alloc::AllocatorMode::Concurrent;
+    const uint64_t seg_b              = cfg.arena_seg_gb * 1024ull * 1024ull * 1024ull;
     opt.alloc_defaults.arena_size     = seg_b;
     opt.alloc_defaults.segment_size   = seg_b;
-    opt.alloc_defaults.max_arena_size = fl.arena_max_gb * 1024ull * 1024ull * 1024ull;
+    opt.alloc_defaults.max_arena_size = cfg.arena_max_gb * 1024ull * 1024ull * 1024ull;
+    opt.exclusive_arena_lock          = cfg.exclusive_arena_lock;
     yikv::db::DB::Init(std::move(opt));
 
-    namespace fs = std::filesystem;
-    fs::path idx_dir = fs::path(fl.db_path) / fl.index_name;
-    bool     exists  = fs::is_directory(idx_dir);
+    // ── TableRegistry: scan all tables, start KafkaSources ───────────────────
+    yikv_server::TableRegistry reg(cfg.db_path, cfg.kafka_default_brokers);
+    reg.ScanAndLoad();
 
-    if (fl.recreate && exists) {
-        fs::remove_all(idx_dir);
-        exists = false;
+    if (reg.TableCount() == 0) {
+        std::cerr << "WARNING: no tables found under " << cfg.db_path << "\n";
     }
 
-    try {
-        if (!exists && fl.create_if_missing) {
-            yikv::schema::Schema sch;
-            std::string          err;
-            if (!sch.LoadJson(ReadFile(fl.schema_json_path), &err)) {
-                std::cerr << "schema: " << err << "\n";
-                return 1;
-            }
-            yikv::db::DB::Instance().CreateKVIndex(fl.index_name, sch);
-        } else {
-            yikv::db::DB::Instance().OpenIndex(fl.index_name);
-        }
-    } catch (const std::exception& e) {
-        std::cerr << e.what() << "\n";
-        return 1;
-    }
+    // Hot-add: inotify watch on db_path for new table directories.
+    reg.StartWatcher();
 
-    yikv::index::KVIndex* kv = yikv::db::DB::Instance().GetKVIndex(fl.index_name);
+    // ── RPC services ──────────────────────────────────────────────────────────
+    yikv_server::rpc::YikvDbGrpcService grpc_svc(&reg);
+    yikv_server::rpc::DbBrpcService*    brpc_svc = new yikv_server::rpc::DbBrpcService(&reg);
 
-    yikv_server::rpc::DbBrpcService* brpc_svc = new yikv_server::rpc::DbBrpcService(kv);
-
-    brpc::Server         server;
-    brpc::ServerOptions  sopt;
+    brpc::Server        server;
+    brpc::ServerOptions sopt;
     sopt.baidu_master_service = brpc_svc;
 
-    if (server.Start(fl.listen.c_str(), &sopt) != 0) {
-        std::cerr << "Fail to start server on " << fl.listen << "\n";
+    if (server.AddService(&grpc_svc, brpc::SERVER_DOESNT_OWN_SERVICE) != 0) {
+        std::cerr << "Fail to add yikv.db.YikvDb gRPC service\n";
         return 1;
     }
-    std::cerr << "yikv-server (brpc) listening on " << fl.listen << "\n";
+    if (server.Start(cfg.listen.c_str(), &sopt) != 0) {
+        std::cerr << "Fail to start server on " << cfg.listen << "\n";
+        return 1;
+    }
+    std::cerr << "yikv-server listening on " << cfg.listen
+              << " (baidu_std + h2:grpc)\n";
+
     server.RunUntilAskedToQuit();
+
+    reg.StopWatcher();
     return 0;
 }

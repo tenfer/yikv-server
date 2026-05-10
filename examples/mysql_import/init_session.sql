@@ -1,0 +1,2 @@
+SET NAMES utf8mb4;
+SET SESSION sql_mode = 'STRICT_TRANS_TABLES';
