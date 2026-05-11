@@ -43,6 +43,32 @@ bazel build //:yikv_server //:yikv_import_pipeline //:yikv_server_bench
 | `exclusive_arena_lock` | 默认 `true`，导入与服务不要同时写同一库 |
 | `kafka.default_brokers` | 可选；表级可在 `table.json` 覆盖 |
 
+### 2.1 容器镜像与 Kubernetes（Ubuntu 22.04）
+
+- **镜像**：多阶段构建见 [`deploy/docker/Dockerfile`](deploy/docker/Dockerfile)。在**含 `yikv/` 与 `yikv-server/` 的仓库根**执行：
+
+  ```bash
+  docker build -f yikv-server/deploy/docker/Dockerfile -t yikv-server:latest .
+  ```
+
+  仅构建编译阶段镜像：`docker build ... --target builder -t yikv-server:build .`
+
+- **说明**：构建阶段镜像安装 `libflatbuffers-dev`、`nlohmann-json3-dev` 等，与常见开发机一致；仓库内 `third_party` 头文件占位不全时由系统头补全。运行阶段镜像仅含二进制与运行时 `.so`（如 OpenSSL、librdkafka）。**容器内开发环境**（挂宿主机源码）用 `builder-base`，见 [`deploy/docker/README.md`](deploy/docker/README.md#开发环境推荐-builder-base)。
+
+- **K8s**：清单使用 Kustomize，[`deploy/k8s/base`](deploy/k8s/base) + [`deploy/k8s/overlays/prod`](deploy/k8s/overlays/prod)。一键脚本（需 `docker`、`kubectl`、`python3`）：
+
+  ```bash
+  ./yikv-server/deploy/k8s/deploy.sh
+  REGISTRY=myregistry.example ./yikv-server/deploy/k8s/deploy.sh   # 构建、push、应用并 rollout
+  KIND_LOAD=1 ./yikv-server/deploy/k8s/deploy.sh                   # kind：构建后将镜像 load 进集群
+  ```
+
+  **本机跑通示例**：安装 [kubectl](https://kubernetes.io/docs/tasks/tools/#kubectl) 与 [kind](https://kind.sigs.k8s.io/docs/user/quick-start/)，`kind create cluster` 后执行 `KIND_LOAD=1 ./yikv-server/deploy/k8s/deploy.sh`（集群需有默认 `StorageClass`，kind 自带）。
+
+  卸载：`./yikv-server/deploy/k8s/teardown.sh`
+
+- **约束**：默认 **1 副本** + `ReadWriteOnce` PVC；多副本需独立数据目录/分片策略。`ScanAndLoad` 可能较慢，Deployment 已配较长 **`startupProbe`（TCP 9000）**。
+
 ---
 
 ## 3. 流程介绍
