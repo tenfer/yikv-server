@@ -94,9 +94,7 @@ std::shared_ptr<TableSlot> TableRegistry::BuildSlotAfterOpen(const std::string& 
             LOG_ERR("no kafka brokers for table " << logical_table << "; skipping KafkaSource");
         } else {
             std::string offset_file =
-                (db_path_ / (logical_table + "_" + kc.topic + "_" +
-                             std::to_string(kc.partition) + ".offset"))
-                    .string();
+                (table_config_dir / "kafka.offset").string();
             slot->kafka_src = std::make_unique<kafka::KafkaSource>(
                 kv, schema,
                 kafka::KafkaSource::Config{

@@ -3,7 +3,7 @@
 // KafkaSource — single-partition Kafka consumer embedded in yikv_server.
 //
 // Consumes JSON messages from one Kafka topic/partition and applies
-// INSERT / UPSERT / DELETE operations to a KVIndex.
+// INSERT / UPSERT (merge) / DELETE operations to a KVIndex.
 //
 // Standard JSON message format (single op):
 //   { "_op": "INSERT", "_ts": <ms>, "field": value, ... }
@@ -14,21 +14,20 @@
 //   [ { "_op": "INSERT", ... }, { "_op": "DELETE", ... } ]
 //
 // Notes:
-//  - _op   : required. Case-insensitive.
-//  - _ts   : required. Unix millisecond event timestamp. Logged; not stored
-//             unless the schema has a field literally named "_ts".
+//  - _op: optional for patch-style incremental updates — omitted or "UPSERT" applies
+//         a partial merge (only JSON keys present are written; arrays append).
+//         "DELETE" must be explicit. "INSERT" fails if the pk already exists.
+//  - _ts: optional (ignored by storage unless a schema field is named "_ts").
 //  - Field names match schema field names (not field_id).
 //  - Unknown field names are silently ignored.
 //  - For DELETE, only the PK field is required.
 //  - Single-threaded consumer (CoW single-writer requirement).
-//  - Offset is persisted to a local file after every committed message.
+//  - Offset is persisted to kafka.offset under the table directory after each message.
 
 #include <atomic>
 #include <cstdint>
 #include <string>
 #include <thread>
-
-#include <nlohmann/json.hpp>
 
 #include "src/index/kv_index.h"
 #include "src/schema/schema.h"
@@ -40,9 +39,8 @@ public:
     struct Config {
         std::string brokers;
         std::string topic;
-        int32_t     partition   = 0;
-        // Full path to the offset persistence file.
-        // Conventionally: {db_path}/{index}_{topic}_{partition}.offset
+        int32_t     partition = 0;
+        // Full path: {canonical_table_dir}/kafka.offset
         std::string offset_file;
     };
 
@@ -59,18 +57,6 @@ public:
 
 private:
     void ConsumeLoop();
-
-    // Parse and apply one JSON object (a single op).
-    // Returns true on success; logs and returns false on error.
-    bool ApplySingleOp(const nlohmann::json& obj);
-
-    // Apply helpers.
-    bool ApplyInsert(const nlohmann::json& obj);
-    bool ApplyUpsert(const nlohmann::json& obj);
-    bool ApplyDelete(const nlohmann::json& obj);
-
-    // Fill doc fields from JSON object (shared by INSERT and UPSERT).
-    bool FillDoc(yikv::index::Doc* doc, const nlohmann::json& obj);
 
     // Offset persistence.
     int64_t LoadOffset() const;

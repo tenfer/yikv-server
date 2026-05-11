@@ -5,7 +5,9 @@
 #include "indexer/source/file/cloud_filesystem.h"
 #include "indexer/source/sql/mysql_wire_source.h"
 #include "indexer/worker/kv_write_worker.h"
+#include "kafka/kafka_import_catchup.h"
 #include "server_config.h"
+#include "table_config.h"
 #include "src/db/db.h"
 #include "src/index/kv_index.h"
 
@@ -187,6 +189,12 @@ void Usage() {
         << "  gs://:  Google Application Default Credentials.\n"
         << "  --import_io_workers    Parallel reader/parser threads (default 4).\n"
         << "  --import_queue_batches Max RecordBatches in flight on the bounded queue (default 32).\n"
+        << "  Kafka catch-up (after bulk import; needs per-table table.json \"kafka\" block):\n"
+        << "    --kafka_catchup                     Consume incrementals and write kafka.offset + kafka_meta.json.\n"
+        << "    --kafka_offline_watermark_sec SEC   Epoch seconds for offsets_for_times (required with --kafka_catchup).\n"
+        << "    --kafka_rewind_minutes N            Rewrite start time as SEC - N*60 before offset lookup (default 0).\n"
+        << "    --kafka_catchup_wall_sec N          Max wall seconds for catch-up loop (0 = use default 7200).\n"
+        << "    Brokers: table.json kafka.brokers, else config.json kafka.default_brokers.\n"
         << "  MySQL env (used when CLI omits; CLI wins): MYSQL_HOST, MYSQL_USER, MYSQL_PASSWORD or MYSQL_PWD,\n"
         << "    MYSQL_DATABASE, MYSQL_TCP_PORT or MYSQL_PORT; same with YIKV_MYSQL_* prefix.\n";
 }
@@ -216,6 +224,12 @@ struct Flags {
     std::size_t              mysql_batch_rows = 4096;
     std::uint64_t            sql_est_rows     = 0;
     bool                     mysql_port_from_cli = false;
+    bool                     kafka_catchup = false;
+    bool                     kafka_watermark_set           = false;
+    int64_t                  kafka_offline_watermark_sec = 0;
+    uint32_t                 kafka_rewind_minutes        = 0;
+    int                      kafka_catchup_wall_sec      = 0;
+    std::string              kafka_default_brokers;
 };
 
 static std::vector<std::string> ReadInitSqlLines(const std::string& path) {
@@ -332,6 +346,17 @@ bool ParseFlags(int argc, char** argv, Flags* f) {
             f->mysql_init_sql_file = argv[++i];
         } else if (std::strcmp(argv[i], "--sql_est_rows") == 0 && i + 1 < argc) {
             f->sql_est_rows = std::strtoull(argv[++i], nullptr, 10);
+        } else if (std::strcmp(argv[i], "--kafka_catchup") == 0) {
+            f->kafka_catchup = true;
+        } else if (std::strcmp(argv[i], "--kafka_offline_watermark_sec") == 0 && i + 1 < argc) {
+            f->kafka_watermark_set = true;
+            f->kafka_offline_watermark_sec =
+                static_cast<int64_t>(std::strtoll(argv[++i], nullptr, 10));
+        } else if (std::strcmp(argv[i], "--kafka_rewind_minutes") == 0 && i + 1 < argc) {
+            f->kafka_rewind_minutes =
+                static_cast<uint32_t>(std::strtoul(argv[++i], nullptr, 10));
+        } else if (std::strcmp(argv[i], "--kafka_catchup_wall_sec") == 0 && i + 1 < argc) {
+            f->kafka_catchup_wall_sec = std::atoi(argv[++i]);
         } else if (std::strcmp(argv[i], "-h") == 0 || std::strcmp(argv[i], "--help") == 0) {
             Usage();
             return false;
@@ -385,6 +410,10 @@ bool ParseFlags(int argc, char** argv, Flags* f) {
         std::cerr << "--create_if_missing requires --schema_json\n";
         return false;
     }
+    if (f->kafka_catchup && !f->kafka_watermark_set) {
+        std::cerr << "--kafka_catchup requires --kafka_offline_watermark_sec SEC (epoch seconds).\n";
+        return false;
+    }
     return true;
 }
 
@@ -395,6 +424,7 @@ bool ApplyConfigFile(Flags* f) {
         f->arena_seg_gb                  = cfg.arena_seg_gb;
         f->arena_max_gb                  = cfg.arena_max_gb;
         f->exclusive_arena_lock_from_cfg = cfg.exclusive_arena_lock;
+        f->kafka_default_brokers         = cfg.kafka_default_brokers;
     } catch (const std::exception& e) {
         std::cerr << "--config: " << e.what() << "\n";
         return false;
@@ -627,6 +657,58 @@ int main(int argc, char** argv) {
         DB::Instance().CloseAll();
         return 1;
     }
+
+    if (fl.kafka_catchup) {
+        std::error_code ec;
+        const fs::path idx_dir = fs::path(fl.db_path) / fl.index_name;
+        const fs::path canon   = fs::weakly_canonical(idx_dir, ec);
+        if (ec) {
+            std::cerr << WallTimestamp() << " kafka_catchup: weakly_canonical: " << ec.message() << "\n";
+            DB::Instance().CloseAll();
+            return 1;
+        }
+        yikv_server::TableConfig tcfg;
+        try {
+            tcfg = yikv_server::LoadTableConfig(canon);
+        } catch (const std::exception& e) {
+            std::cerr << WallTimestamp() << " kafka_catchup table.json: " << e.what() << "\n";
+            DB::Instance().CloseAll();
+            return 1;
+        }
+        if (!tcfg.kafka.has_value()) {
+            std::cerr << WallTimestamp() << " kafka_catchup: table.json has no \"kafka\" block\n";
+            DB::Instance().CloseAll();
+            return 1;
+        }
+        const auto& kc = *tcfg.kafka;
+        std::string brokers =
+            kc.brokers.empty() ? fl.kafka_default_brokers : kc.brokers;
+        if (brokers.empty()) {
+            std::cerr << WallTimestamp()
+                      << " kafka_catchup: missing brokers (table.json kafka.brokers or config "
+                         "kafka.default_brokers)\n";
+            DB::Instance().CloseAll();
+            return 1;
+        }
+        yikv::index::KVIndex* kidx = DB::Instance().GetKVIndex(fl.index_name);
+        if (!kidx) {
+            std::cerr << WallTimestamp() << " kafka_catchup: index not open\n";
+            DB::Instance().CloseAll();
+            return 1;
+        }
+        yikv_server::kafka::KafkaImportCatchupOptions copts;
+        copts.brokers                = std::move(brokers);
+        copts.topic                  = kc.topic;
+        copts.partition              = kc.partition;
+        copts.offline_watermark_sec  = fl.kafka_offline_watermark_sec;
+        copts.rewind_minutes         = fl.kafka_rewind_minutes;
+        if (fl.kafka_catchup_wall_sec > 0) copts.max_wall_seconds = fl.kafka_catchup_wall_sec;
+        if (!yikv_server::kafka::RunKafkaImportCatchup(canon, kidx, sch, copts)) {
+            DB::Instance().CloseAll();
+            return 1;
+        }
+    }
+
     DB::Instance().CloseAll();
     return 0;
 }
